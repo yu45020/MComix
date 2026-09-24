@@ -1,3 +1,9 @@
+# MComix 3.2.1
+## In development
+
+### Bug fixes
+- Fixed error/crash when trying to open PDF file on Windows build.
+
 # MComix 3.2.0
 ## Release date: 2026-08-20
 
