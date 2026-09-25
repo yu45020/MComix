@@ -1,4 +1,5 @@
 """Child process code for native PDF multiprocessing."""
+from __future__ import annotations
 
 import io
 import os
@@ -7,9 +8,12 @@ from PIL import Image, ExifTags
 from typing import Generator, Optional
 
 try:
-    import fitz
+    import pymupdf
 except ImportError:
-    import fitz_old as fitz
+    try:
+        import fitz as pymupdf
+    except ImportError:
+        import fitz_old as pymupdf
 
 from mcomix.constants import PDF_RENDER_DPI_DEF
 
@@ -18,14 +22,14 @@ from mcomix.constants import PDF_RENDER_DPI_DEF
 XREF_DELIMITER = '_mcmxref'
 
 
-class FitzWorker:
+class MuPDFWorker:
     def __init__(self, filename: Optional[str], log_level: Optional[int] = None) -> None:
         self._extension: Optional[str] = None
         self._complex_doc = False
         self.log = mp.get_logger()
         if log_level is not None:
             self.log.setLevel(log_level)
-        self.doc = fitz.open(filename)
+        self.doc = pymupdf.open(filename)
 
     def page_count(self) -> int:
         return self.doc.page_count
@@ -83,8 +87,8 @@ class FitzWorker:
                 page_num + 1, len(image_info))
             return False
         info = image_info[0]
-        img_rect = fitz.Rect(info.get('bbox', (0, 0, 0, 0))).irect
-        page_rect = fitz.Rect(page.mediabox).irect
+        img_rect = pymupdf.Rect(info.get("bbox", (0, 0, 0, 0))).irect
+        page_rect = pymupdf.Rect(page.mediabox).irect
         page_area = page_rect.get_area()
         area_diff = abs(page_area - img_rect.get_area())
         is_full_page: bool = area_diff < 0.05 * page_area
@@ -115,8 +119,7 @@ class FitzWorker:
         extension = 'png'
         try:
             xref = self._get_image_xref(page_num)
-            img = fitz.image_profile(
-                self.doc.xref_stream_raw(xref))
+            img = pymupdf.image_profile(self.doc.xref_stream_raw(xref))
             # If image_profile returns an empty dict, the image type is
             # "exotic" and not supported for direct extraction.
             # That doesn't mean that the images can't be extracted.

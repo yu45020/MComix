@@ -8,7 +8,7 @@ from multiprocessing.managers import BaseManager, BaseProxy
 
 from typing import Optional, Generator
 
-from .child import FitzWorker
+from .child import MuPDFWorker
 
 
 class GeneratorProxy(BaseProxy):
@@ -24,7 +24,7 @@ class GeneratorProxy(BaseProxy):
 
 
 class WorkerProxy(BaseProxy):
-    """Proxy type for FitzWorker methods.
+    """Proxy type for MuPDFWorker methods.
 
     This code will run in the child processes, when triggered by
     the registered methods of the Manager.
@@ -38,43 +38,47 @@ class WorkerProxy(BaseProxy):
 
     @classmethod
     def _count_pages(cls) -> int:
-        w = FitzWorker(cls.filename)
+        w = MuPDFWorker(cls.filename)
         return w.page_count()
 
     @classmethod
     def _list_pages(cls) -> Generator[str, None, None]:
-        w = FitzWorker(cls.filename)
+        w = MuPDFWorker(cls.filename)
         return w.iter_contents()
 
     @classmethod
     def _extract_pages(cls, entries, save_path: str) -> Generator[str, None, None]:
-        w = FitzWorker(cls.filename)
+        w = MuPDFWorker(cls.filename)
         for e in entries:
             w.extract_file(e, save_path)
             yield e
 
 
-class FitzManager(BaseManager):
+class MuPDFManager(BaseManager):
     """Multiprocessing manager to hold proxied worker callables."""
 
     pass
 
 
-FitzManager.register('open', WorkerProxy._open)
-FitzManager.register('page_count', WorkerProxy._count_pages)
-FitzManager.register('iter_contents', WorkerProxy._list_pages, proxytype=GeneratorProxy)
-FitzManager.register('extract_pages', WorkerProxy._extract_pages, proxytype=GeneratorProxy)
+MuPDFManager.register("open", WorkerProxy._open)
+MuPDFManager.register("page_count", WorkerProxy._count_pages)
+MuPDFManager.register(
+    "iter_contents", WorkerProxy._list_pages, proxytype=GeneratorProxy
+)
+MuPDFManager.register(
+    "extract_pages", WorkerProxy._extract_pages, proxytype=GeneratorProxy
+)
 
 
-class FitzProcessWrangler(threading.local):
-    """Thread-local state object holding a FitzManager instance.
+class MuPDFProcessWrangler(threading.local):
+    """Thread-local state object holding a MuPDFManager instance.
 
     This is necessary so that each Mcomix extractor thread has its own
-    FitzManager instance (and, therefore, its own worker process).
+    MuPDFManager instance (and, therefore, its own worker process).
     """
 
     def __init__(self, filename, log_level):
-        self.mgr = FitzManager()
+        self.mgr = MuPDFManager()
         self.mgr.start()
         self.mgr.open(filename)
         self.log = mp.get_logger()
@@ -96,13 +100,14 @@ class FitzProcessWrangler(threading.local):
 
 # Test code, this module can be called directly with one argument (a PDF
 # filename), and will print a list of all pages in the PDF (produced by
-# a spawned FitzWorker process)
+# a spawned MuPDFWorker process)
 if __name__ == "__main__":
     mp.freeze_support()
     mp.set_start_method('spawn')
     infile = sys.argv[1]
     import logging
-    wrangler = FitzProcessWrangler(infile, log_level=logging.DEBUG)
+
+    wrangler = MuPDFProcessWrangler(infile, log_level=logging.DEBUG)
 
     print(f"All pages in PDF {infile}:")
     for file in wrangler.iter_contents():
