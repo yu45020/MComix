@@ -4,13 +4,13 @@
 
 import multiprocessing as mp
 from mcomix.archive import archive_base
-from mcomix.archive.native_pdf.manager import FitzProcessWrangler
+from mcomix.archive.native_pdf.manager import MuPDFProcessWrangler
 from mcomix.log import getLevel
 
 from typing import Generator, List
 
 
-class FitzArchive(archive_base.BaseArchive):
+class MuPDFArchive(archive_base.BaseArchive):
     """PDF file reader/extractor using PyMuPDF."""
 
     # Concurrent calls to extract welcome!
@@ -28,10 +28,10 @@ class FitzArchive(archive_base.BaseArchive):
         """Report whether this extractor is available (always true)."""
         return True
 
-    def _open_doc(self) -> FitzProcessWrangler:
-        """Create a new FitzManager instance for processes accessing the archive."""
+    def _open_doc(self) -> MuPDFProcessWrangler:
+        """Create a new MuPDFManager instance for processes accessing the archive."""
         self.close()
-        self._mgr = FitzProcessWrangler(self.archive, log_level=self.log.level)
+        self._mgr = MuPDFProcessWrangler(self.archive, log_level=self.log.level)
         return self._mgr
 
     def close(self) -> None:
@@ -40,7 +40,7 @@ class FitzArchive(archive_base.BaseArchive):
             del self._mgr
 
     @property
-    def mgr(self) -> FitzProcessWrangler:
+    def mgr(self) -> MuPDFProcessWrangler:
         if not hasattr(self, '_mgr'):
             return self._open_doc()
         return self._mgr
