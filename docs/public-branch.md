@@ -13,21 +13,21 @@ only at `5b5850fb`. That is expected.
 Every sync replaces `public`'s files with `main`'s, so make every change on
 `main` first. A commit made only on `public` is dropped by the next sync.
 
-Run the commands in PowerShell from the repository root, with `main` (not
-`public`) checked out: `git branch -f` refuses to move the checked-out
-branch. PowerShell needs the quotes around `'main^{tree}'`. `git
-commit-tree` writes a commit without touching the working folder or any
-branch; `git branch -f` then moves `public` to it only if `commit-tree`
-succeeded.
+Run the commands in Command Prompt (cmd) from the repository root, with
+`main` (not `public`) checked out: `git branch -f` refuses to move the
+checked-out branch. `main^{tree}` stays in double quotes, because cmd treats
+a bare `^` as an escape character. `git commit-tree` writes a commit without
+touching the working folder or any branch, and `for /f` runs `git branch -f`
+on the commit it prints; if it fails, it prints nothing and `public` stays
+where it was. In a `.bat` file, write `%%c` instead of `%c`.
 
 ## Create `public`
 
 Make one commit whose files are `main`'s and whose parent is the upstream
 base, then point `public` at it:
 
-```powershell
-$c = git commit-tree 'main^{tree}' -p 5b5850fb -m "MComix fork: changes since upstream 5b5850fb"
-if ($LASTEXITCODE -eq 0) { git branch -f public $c }
+```bat
+for /f %c in ('git commit-tree "main^{tree}" -p 5b5850fb -m "MComix fork: changes since upstream 5b5850fb"') do git branch -f public %c
 ```
 
 ## Update `public`
@@ -37,10 +37,12 @@ Fetch, then add a commit on top of the published `main` that copies local
 keeps `public` one fast-forward ahead of GitHub, even if the local branch
 was rebuilt or amended since the last push:
 
-```powershell
+```bat
 git fetch origin
-$c = git commit-tree 'main^{tree}' -p origin/main -m "Sync with main"
-if ($LASTEXITCODE -eq 0) { git branch -f public $c }
+```
+
+```bat
+for /f %c in ('git commit-tree "main^{tree}" -p origin/main -m "Sync with main"') do git branch -f public %c
 ```
 
 Don't run `git merge main` on `public`, which would bring in all of `main`'s
@@ -57,11 +59,11 @@ the new commit.
 
 List what you are about to publish, and compare its files with `main`:
 
-```powershell
+```bat
 git log --oneline origin/main..public
 ```
 
-```powershell
+```bat
 git diff --stat main public
 ```
 
@@ -74,13 +76,13 @@ push; run the update again.
 Push `public` as the remote's `main`. Never push the local `main`, which
 would publish its full history.
 
-```powershell
+```bat
 git push origin public:main
 ```
 
 After a rebuild, overwrite the remote only if it is still at the commit you
 last fetched:
 
-```powershell
+```bat
 git push --force-with-lease origin public:main
 ```
