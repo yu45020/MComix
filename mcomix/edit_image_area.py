@@ -1,14 +1,20 @@
 """edit_image_area.py - The area of the editing archive window that displays images."""
 
 import os
-from gi.repository import Gdk, GdkPixbuf, Gtk
+import cairo
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 
 from mcomix import image_tools
 from mcomix import i18n
 from mcomix import thumbnail_tools
 from mcomix import thumbnail_view
-from mcomix.preferences import prefs
 from mcomix.i18n import _
+
+
+def _tooltip(path: str) -> str:
+    """The tooltip column is markup."""
+    return GLib.markup_escape_text(i18n.to_unicode(os.path.basename(path)))
+
 
 class _ImageArea(Gtk.ScrolledWindow):
 
@@ -52,6 +58,7 @@ class _ImageArea(Gtk.ScrolledWindow):
         self._filler.fill(0)
 
         self._window.imagehandler.page_available += self._on_page_available
+        self.connect('destroy', self._detach_callbacks)
 
         self._ui_manager = Gtk.UIManager()
         ui_description = """
@@ -70,31 +77,41 @@ class _ImageArea(Gtk.ScrolledWindow):
                 self._remove_pages)])
         self._ui_manager.insert_action_group(actiongroup, 0)
 
+    def _detach_callbacks(self, widget: Gtk.Widget) -> None:
+        self._window.imagehandler.page_available -= self._on_page_available
+        self.cleanup()
+
     def fetch_images(self):
         """Load all the images in the archive or directory."""
         for page in range(1, self._window.imagehandler.get_number_of_pages() + 1):
             path = self._window.imagehandler.get_path_to_page(page)
-            encoded_path = i18n.to_unicode(os.path.basename(path))
-            encoded_path = encoded_path.replace('&', '&amp;')
-            self._liststore.append([self._filler, encoded_path, path, False])
+            self._liststore.append([self._filler, _tooltip(path), path, False])
 
     def _generate_thumbnail(self, uid):
         assert isinstance(uid, str)
         path = uid
+        if not self._window.filehandler.file_is_available(path):
+            return None
         try:
-            if not self._window.filehandler.file_is_available(path):
-                return None
-        except KeyError:
-            # Not a page from the current archive, ignore.
-            pass
-        pixbuf = self._thumbnailer.thumbnail(path)
+            source = self._window.filehandler.get_image_source(path)
+        except Exception:
+            source = path
+        if isinstance(source, bytes):
+            # Read on demand from the archive.
+            try:
+                pixbuf = image_tools.load_pixbuf_size(source, self._thumbnail_size,
+                                                      self._thumbnail_size)
+            except Exception:
+                pixbuf = None
+        else:
+            pixbuf = self._thumbnailer.thumbnail(path)
         if pixbuf is None:
             pixbuf = image_tools.MISSING_IMAGE_ICON
         return pixbuf
 
     def add_extra_image(self, path):
         """Add an imported image (at <path>) to the end of the image list."""
-        self._liststore.append([self._filler, os.path.basename(path), path, False])
+        self._liststore.append([self._filler, _tooltip(path), path, False])
 
     def get_file_listing(self):
         """Return a list with the full paths to all the images, in order."""
@@ -134,10 +151,22 @@ class _ImageArea(Gtk.ScrolledWindow):
         for the cursor at the top left corner of the thumbnail (so that we
         might actually see where we are dropping!).
         """
-        path = iconview.get_cursor()[0]
-        surface = treeview.create_row_drag_icon(path)
-        width, height = surface.get_width(), surface.get_height()
-        pixbuf = Gdk.pixbuf_get_from_surface(surface, 0, 0, width, height)
+        has_cursor, path, cell = iconview.get_cursor()
+        if not has_cursor:
+            return
+        surface = iconview.create_drag_icon(path)
+        if surface is None:
+            return
+        # Win32 surfaces do not expose image-surface width/height methods.
+        x1, y1, x2, y2 = cairo.Context(surface).clip_extents()
+        width, height = int(x2 - x1), int(y2 - y1)
+        # Normalize device scale before extraction: GDK's native-surface and
+        # image-surface paths otherwise interpret HiDPI dimensions differently.
+        image = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        cr = cairo.Context(image)
+        cr.set_source_surface(surface, 0, 0)
+        cr.paint()
+        pixbuf = Gdk.pixbuf_get_from_surface(image, 0, 0, width, height)
         Gtk.drag_set_icon_pixbuf(context, pixbuf, -5, -5)
 
     def cleanup(self):

@@ -7,30 +7,28 @@ All menu accelerators are handled using GTK's built-in accelerator map. The map
 doesn't seem to support multiple keybindings for one action, though, so this
 module takes care of the problem.
 
-At runtime, other modules can register a callback for a specific action name.
-This action name has to be registered in BINDING_INFO, or an Exception will be
-thrown. The module can pass a list of default keybindings. If the user hasn't
-configured different bindings, the default ones will be used.
+BINDING_INFO is the action table: each action's title and group. At runtime,
+other modules can register a callback for a specific action name. This action
+name has to be registered in BINDING_INFO, or an Exception will be thrown. An
+action's default keybindings are the bindings passed to its register() call
+(event.py). If the user hasn't configured different bindings, the default ones
+will be used.
 
 Afterwards, the action will be stored together with its keycode/modifier in a
 dictionary:
 (keycode: int, modifier: GdkModifierType) =>
     (action: string, callback: func, args: list, kwargs: dict)
 
-Default keybindings will be stored here at initialization:
-action-name: string => [keycodes: list]
-
 
 Each action_name can have multiple keybindings.
 """
 
-import os
-import shutil
 from gi.repository import Gtk
 import json
 from collections import defaultdict
 
 from mcomix import constants
+from mcomix.atomic_file import atomic_write
 from mcomix import log
 from mcomix.i18n import _
 
@@ -44,8 +42,8 @@ BINDING_INFO = {
     'next_page_ff' : { 'title': _('Forward ten pages'), 'group': _('Navigation') },
     'previous_page_dynamic' : { 'title': _('Previous page (dynamic)'), 'group': _('Navigation') },
     'next_page_dynamic' : { 'title': _('Next page (dynamic)'), 'group': _('Navigation') },
-    'previous_page_singlestep': { 'title': _('Previous page (always one page)'), 'group': _('Navigation') },
-    'next_page_singlestep': { 'title': _('Next page (always one page)'), 'group': _('Navigation') },
+    'previous_page_singlestep': { 'title': _('Shift pairing back'), 'group': _('Navigation') },
+    'next_page_singlestep': { 'title': _('Shift pairing forward'), 'group': _('Navigation') },
 
     'first_page' : { 'title': _('First page'), 'group': _('Navigation') },
     'last_page' : { 'title': _('Last page'), 'group': _('Navigation') },
@@ -158,7 +156,6 @@ class _KeybindingManager(object):
         self._action_to_bindings = defaultdict(list) # action name => [ (key code, key modifier), ]
         self._binding_to_action = {} # (key code, key modifier) => action name
 
-        self._migrate_from_old_bindings()
         self._initialize()
 
     def register(self, name, bindings, callback, args=[], kwargs={}):
@@ -175,7 +172,7 @@ class _KeybindingManager(object):
 
         # Load stored keybindings, or fall back to passed arguments
         keycodes = self._action_to_bindings[name]
-        if keycodes == []:
+        if not keycodes and name not in self._configured_actions:
             keycodes = [tuple(Gtk.accelerator_parse(binding)) for binding in bindings]
 
         for keycode in keycodes:
@@ -188,10 +185,7 @@ class _KeybindingManager(object):
                 self._binding_to_action[keycode] = name
                 self._action_to_bindings[name].append(keycode)
 
-        # Add gtk accelerator for labels in menu
-        if len(self._action_to_bindings[name]) > 0:
-            key, mod = self._action_to_bindings[name][0]
-            Gtk.AccelMap.change_entry('<Actions>/mcomix-main/%s' % name, key, mod, True)
+        self._update_menu_accel(name)
 
         self._action_to_callback[name] = (callback, args, kwargs)
 
@@ -208,31 +202,41 @@ class _KeybindingManager(object):
         assert name in BINDING_INFO, "'%s' isn't a valid keyboard action." % name
 
         nb = tuple(Gtk.accelerator_parse(new_binding))
+        ob = tuple(Gtk.accelerator_parse(old_binding)) if old_binding else None
         old_action_with_nb = self._binding_to_action.get(nb)
-        if old_action_with_nb is not None:
-            # The new key is already bound to an action, erase the action
-            self._binding_to_action.pop(nb)
+        bindings = self._action_to_bindings[name]
+        if old_action_with_nb == name and (ob is None or ob == nb):
+            return old_action_with_nb
+
+        if ob in bindings:
+            # Preserve the edited position after removing any duplicate key.
+            index = sum(binding not in (ob, nb)
+                        for binding in bindings[:bindings.index(ob)])
+            bindings[:] = [binding for binding in bindings
+                           if binding not in (ob, nb)]
+            bindings.insert(index, nb)
+        elif nb not in bindings:
+            bindings.append(nb)
+
+        if ob != nb and self._binding_to_action.get(ob) == name:
+            del self._binding_to_action[ob]
+        if old_action_with_nb is not None and old_action_with_nb != name:
             self._action_to_bindings[old_action_with_nb].remove(nb)
-
-        if old_binding and name != old_action_with_nb:
-            # The action already had a key that is now being replaced
-            ob = tuple(Gtk.accelerator_parse(old_binding))
-            self._binding_to_action[nb] = name
-
-            # Remove action bound to the key.
-            if ob in self._binding_to_action:
-                self._binding_to_action.pop(ob)
-
-            if ob in self._action_to_bindings[name]:
-                idx = self._action_to_bindings[name].index(ob)
-                self._action_to_bindings[name].pop(idx)
-                self._action_to_bindings[name].insert(idx, nb)
-        else:
-            self._binding_to_action[nb] = name
-            self._action_to_bindings[name].append(nb)
-
+            self._configured_actions.add(old_action_with_nb)
+            self._update_menu_accel(old_action_with_nb)
+        self._binding_to_action[nb] = name
+        self._configured_actions.add(name)
+        self._update_menu_accel(name)
         self.save()
         return old_action_with_nb
+
+    def _update_menu_accel(self, name: str) -> None:
+        """Keep menu labels on the action's first remaining shortcut."""
+        path = '<Actions>/mcomix-main/%s' % name
+        if Gtk.AccelMap.lookup_entry(path)[0]:
+            bindings = self._action_to_bindings[name]
+            key, modifiers = bindings[0] if bindings else (0, 0)
+            Gtk.AccelMap.change_entry(path, key, modifiers, True)
 
     def clear_accel(self, name, binding):
         """ Remove binding for an action """
@@ -241,12 +245,15 @@ class _KeybindingManager(object):
         ob = tuple(Gtk.accelerator_parse(binding))
         self._action_to_bindings[name].remove(ob)
         self._binding_to_action.pop(ob)
+        self._configured_actions.add(name)
+        self._update_menu_accel(name)
 
         self.save()
 
     def clear_all(self):
         """ Removes all keybindings. The changes are only persisted if
         save() is called afterwards. """
+        self._configured_actions = set()
         self._action_to_callback = {}
         self._action_to_bindings = defaultdict(list)
         self._binding_to_action = {}
@@ -254,37 +261,29 @@ class _KeybindingManager(object):
     def execute(self, keybinding):
         """ Executes an action that has been registered for the
         passed keyboard event. If no action is bound to the passed key, this
-        method is a no-op. """
-        if keybinding in self._binding_to_action:
-            action = self._binding_to_action[keybinding]
-            func, args, kwargs = self._action_to_callback[action]
-            self._window.emit_stop_by_name('key_press_event')
-            return func(*args, **kwargs)
-
-        # Some keys enable additional modifiers (NumLock enables GDK_MOD2_MASK),
-        # which prevent direct lookup simply by being pressed.
-        # XXX: Looking up by key/modifier probably isn't the best implementation,
-        # so limit possible states to begin with?
-        for stored_binding, action in self._binding_to_action.items():
-            stored_keycode, stored_flags = stored_binding
-            if stored_keycode == keybinding[0] and stored_flags & keybinding[1]:
-                func, args, kwargs = self._action_to_callback[action]
-                self._window.emit_stop_by_name('key_press_event')
-                return func(*args, **kwargs)
+        method is a no-op, as it is when the action of the same name is
+        insensitive (no file open). """
+        action = self._binding_to_action.get(keybinding)
+        if action is None:
+            return
+        menu_action = self._window.actiongroup.get_action(action)
+        if menu_action is not None and not menu_action.is_sensitive():
+            return
+        func, args, kwargs = self._action_to_callback[action]
+        self._window.emit_stop_by_name('key_press_event')
+        return func(*args, **kwargs)
 
     def save(self):
         """ Stores the keybindings that have been set to disk. """
         # Collect keybindings for all registered actions
         action_to_keys = {}
         for action, bindings in self._action_to_bindings.items():
-            if bindings is not None:
-                action_to_keys[action] = [
-                    Gtk.accelerator_name(keyval, modifiers) for
-                    (keyval, modifiers) in bindings
-                ]
-        fp = open(constants.KEYBINDINGS_CONF_PATH, "w")
-        json.dump(action_to_keys, fp, indent=2)
-        fp.close()
+            action_to_keys[action] = [
+                Gtk.accelerator_name(keyval, modifiers) for
+                (keyval, modifiers) in bindings
+            ]
+        with atomic_write(constants.KEYBINDINGS_CONF_PATH) as fp:
+            json.dump(action_to_keys, fp, indent=2)
 
     def _initialize(self):
         """ Restore keybindings from disk. """
@@ -292,10 +291,13 @@ class _KeybindingManager(object):
             fp = open(constants.KEYBINDINGS_CONF_PATH, "r")
             stored_action_bindings = json.load(fp)
             fp.close()
+        except FileNotFoundError:
+            stored_action_bindings = {}
         except Exception as e:
             log.error(_("Couldn't load keybindings: %s"), e)
             stored_action_bindings = {}
 
+        self._configured_actions = set(stored_action_bindings)
         for action in BINDING_INFO.keys():
             if action in stored_action_bindings:
                 bindings = [
@@ -310,22 +312,6 @@ class _KeybindingManager(object):
     def get_bindings_for_action(self, name):
         """ Returns a list of (keycode, modifier) for the action C{name}. """
         return self._action_to_bindings[name]
-
-    def _migrate_from_old_bindings(self):
-        """ This method deals with upgrading from MComix 1.0 and older to
-        MComix 1.01, which integrated all UI hotkeys into this class. Simply
-        remove old files and start from default values. """
-        gtkrc = os.path.join(constants.CONFIG_DIR, 'keybindings-Gtk.rc')
-        if os.path.isfile(gtkrc):
-            # In case the user has made modifications to his files,
-            # keep the old ones around for reference.
-            if not os.path.isfile(gtkrc + '.delete-me'):
-                shutil.move(gtkrc, gtkrc + '.delete-me')
-
-            if os.path.isfile(constants.KEYBINDINGS_CONF_PATH) and \
-                not os.path.isfile(constants.KEYBINDINGS_CONF_PATH + '.delete-me'):
-                shutil.move(constants.KEYBINDINGS_CONF_PATH,
-                        constants.KEYBINDINGS_CONF_PATH + '.delete-me')
 
 _manager = None
 

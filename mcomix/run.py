@@ -18,13 +18,17 @@ from mcomix import (
     preferences,
 )
 
-def wait_and_exit():
-    """ Wait for the user pressing ENTER before closing. This should help
-    the user find possibly missing dependencies when starting, since the
-    Python window will not close down immediately after the error. """
-    if sys.platform == 'win32' and not sys.stdin.closed and not sys.stdout.closed:
-        print()
-        input("Press ENTER to continue...")
+def wait_and_exit() -> None:
+    """Keep dependency errors visible when started in an interactive console."""
+    try:
+        if sys.platform == 'win32' and sys.stdin is not None and \
+                sys.stdout is not None and not sys.stdin.closed and \
+                not sys.stdout.closed and sys.stdin.isatty() and \
+                sys.stdout.isatty():
+            print()
+            input("Press ENTER to continue...")
+    except (EOFError, OSError):
+        pass
     sys.exit(1)
 
 def print_version(opt, value, parser, *args, **kwargs):
@@ -52,6 +56,13 @@ def parse_arguments(argv):
             help=_('Show the version number and exit.'))
     parser.add_option('--lang', dest='language_code', action='store',
             help=_('Temporarily override the interface language.'))
+    parser.add_option('-e', '--entry', dest='entry', action='store', default='',
+            metavar=_('NAME'),
+            help=_('Open PATH at the page with this name inside the archive '
+                   '(folders separated by /), or this file in the folder.'))
+    parser.add_option('-p', '--page', dest='page', action='store', type='int',
+            metavar='N',
+            help=_('Open PATH at page N, when --entry is not given or names no page.'))
 
     viewmodes = optparse.OptionGroup(parser, _('View modes'))
     viewmodes.add_option('-f', '--fullscreen', dest='fullscreen', action='store_true',
@@ -79,12 +90,13 @@ def parse_arguments(argv):
             choices=('all', 'debug', 'info', 'warn', 'error'), default='warn',
             metavar='[ all | debug | info | warn | error ]',
             help=_('Sets the desired output log level.'))
-    # This supresses an error when MComix is used with cProfile
-    debugopts.add_option('-o', dest='output', action='store',
-            default='', help=optparse.SUPPRESS_HELP)
     parser.add_option_group(debugopts)
 
     opts, args = parser.parse_args(argv)
+    if opts.page is not None and opts.page < 1:
+        parser.error(_('--page needs a page number of 1 or more.'))
+    if (opts.page is not None or opts.entry) and not args:
+        parser.error(_('--page and --entry need a PATH.'))
 
     # Fix up log level to use constants from log.
     if opts.loglevel == 'all':
@@ -113,11 +125,7 @@ def setup_dependencies():
 
         from gi.repository import Gdk, GLib, Gtk  # noqa
 
-        # Older GLib requires initialization before using threads
-        if GLib.check_version(2, 32, 0) is not None:
-            GLib.threads_init()
-
-    except AssertionError:
+    except ValueError:
         log.error(_("You do not have the required versions of GTK+ 3.0 and PyGObject installed."))
         wait_and_exit()
 
@@ -127,18 +135,7 @@ def setup_dependencies():
         wait_and_exit()
 
     try:
-        import PIL.Image
-
-        try:
-            pil_major_version = int(PIL.__version__[0:PIL.__version__.index('.')])
-        except (ValueError, IndexError):
-            pil_major_version = 0
-        if pil_major_version < 6:
-            log.error(_("You don't have the required version of the Python Imaging Library Fork (Pillow) installed."))
-            log.error(_('Installed Pillow version is: %s') % PIL.__version__)
-            log.error(_('Required Pillow version is: 6.0.0 or higher'))
-            wait_and_exit()
-
+        import PIL.Image  # noqa
     except ImportError:
         log.error(_('Python Imaging Library Fork (Pillow) 6.0.0 or higher is required.'))
         log.error(_('No version of the Python Imaging Library was found on your system.'))
@@ -181,17 +178,10 @@ def run():
     icons.load_icons()
 
     open_path = None
-    open_page = 1
     if len(args) == 1:
         open_path = args[0]
     elif len(args) > 1:
         open_path = args
-
-    elif preferences.prefs['auto load last file'] \
-        and preferences.prefs['path to last file'] \
-        and os.path.isfile(preferences.prefs['path to last file']):
-        open_path = preferences.prefs['path to last file']
-        open_page = preferences.prefs['page of last file']
 
     # Some languages require a RTL layout
     if preferences.prefs['language'] in ('he', 'fa'):
@@ -213,7 +203,8 @@ def run():
     window = main.MainWindow(fullscreen = opts.fullscreen, is_slideshow = opts.slideshow,
             show_library = opts.library, manga_mode = opts.manga,
             double_page = opts.doublepage, zoom_mode = opts.zoommode,
-            open_path = open_path, open_page = open_page)
+            open_path = open_path, open_page = opts.page or 0,
+            open_entry = opts.entry)
     main.set_main_window(window)
 
     if 'win32' != sys.platform:

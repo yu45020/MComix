@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 
+import atexit
 import os
-import sys
+import shutil
+import tempfile
 
-# Useful to be able to run the current testsuite with another MComix version.
-mcomix_path = os.environ.get('MCOMIXPATH', None)
-if mcomix_path is not None:
-    sys.path.insert(0, mcomix_path)
+# Before the first mcomix import: constants binds the config, data and thumbnail paths under
+# %APPDATA% when imported, and tests never touch the owner's %APPDATA%\MComix. Child processes
+# inherit the folder: spawned ones skip atexit, so a folder of their own would be left behind.
+if 'MCOMIX_TEST_APPDATA' not in os.environ:
+    _appdata = tempfile.mkdtemp(prefix='mcomix-test-appdata.')
+    os.environ['APPDATA'] = os.environ['MCOMIX_TEST_APPDATA'] = _appdata
+    atexit.register(shutil.rmtree, _appdata, ignore_errors=True)
 
 # Configure locale.
 
@@ -33,8 +38,6 @@ log.setLevel('DEBUG')
 #   configuration for MComix (preferences, library, ...)
 # - make sure MComix state is reset before each test
 
-import shutil
-import tempfile
 import unittest
 
 from mcomix.preferences import prefs
@@ -44,53 +47,50 @@ default_prefs.update(prefs)
 
 class MComixTest(unittest.TestCase):
 
+    _storage_environment = ('HOME', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME',
+                            'TMPDIR', 'TEMP', 'TMP')
+
     def setUp(self):
-        base_tmpdir = os.path.join('test', 'tmp')
-        if not os.path.exists(base_tmpdir):
-            os.mkdir(base_tmpdir)
+        self._original_cwd = os.getcwd()
+        self._original_environment = {
+            name: os.environ.get(name) for name in self._storage_environment}
+        self._original_tempdir = tempfile.tempdir
+        self._original_prefs = dict(prefs)
+        self.tmp_dir = None
+        # unittest runs registered cleanups even when a subclass setup fails.
+        self.addCleanup(self._restore_test_storage)
         name = '.'.join((
             self.__module__.split('.')[-1],
             self.__class__.__name__,
             self._testMethodName))
-        self.tmp_dir = tempfile.mkdtemp(dir=base_tmpdir, prefix='%s.' % name)
-        # Change storage directories.
+        self.tmp_dir = tempfile.mkdtemp(prefix='mcomix.%s.' % name)
         home_dir = os.path.join(self.tmp_dir, 'home')
         os.mkdir(home_dir)
         os.environ['HOME'] = home_dir
         os.environ['XDG_DATA_HOME'] = os.path.join(home_dir, 'data')
         os.environ['XDG_CONFIG_HOME'] = os.path.join(home_dir, 'config')
-        # Create and setup temporary directory.
         temp_dir = os.path.join(self.tmp_dir, 'tmp')
         os.mkdir(temp_dir)
         os.environ['TMPDIR'] = os.environ['TEMP'] = os.environ['TMP'] = temp_dir
-        # Make sure tempfile module uses the correct directory.
         tempfile.tempdir = temp_dir
-        # Reset preferences to default.
         prefs.clear()
         prefs.update(default_prefs)
 
-    def tearDown(self):
-        name = '.'.join((
-            self.__module__.split('.')[-1],
-            self.__class__.__name__,
-            self._testMethodName))
-        failed = False
-        if hasattr(self._resultForDoCleanups, '_excinfo'):
-            # When running under py.test2
-            exclist = self._resultForDoCleanups._excinfo
-            if exclist is not None:
-                for exc in exclist:
-                    if 'XFailed' != exc.typename:
-                        failed = True
-                        break
-        if hasattr(self._resultForDoCleanups, 'failures'):
-            # When running under nosetest2
-            for failure, traceback in self._resultForDoCleanups.failures:
-                if failure.id() == self.id():
-                    failed = True
-                    break
-        if not failed:
-            shutil.rmtree(self.tmp_dir)
+    def _restore_test_storage(self) -> None:
+        # Restore cwd and process state before removing their temporary paths.
+        try:
+            os.chdir(self._original_cwd)
+        finally:
+            for name, value in self._original_environment.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            tempfile.tempdir = self._original_tempdir
+            prefs.clear()
+            prefs.update(self._original_prefs)
+            if self.tmp_dir is not None:
+                shutil.rmtree(self.tmp_dir)
 
 # Helper to get path to testsuite sample files.
 

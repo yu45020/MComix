@@ -22,7 +22,6 @@ class Statusbar(Gtk.EventBox):
 
         # Create popup menu for enabling/disabling status boxes.
         self.ui_manager = Gtk.UIManager()
-        self.tooltipstatus = TooltipStatusHelper(self.ui_manager, self.status)
         ui_description = """
         <ui>
             <popup name="Statusbar">
@@ -86,10 +85,6 @@ class Statusbar(Gtk.EventBox):
         page_info += ' / %d' % total
         self._page_info = page_info
 
-    def get_page_number(self):
-        """Returns the bar's page information."""
-        return self._page_info
-
     def set_file_number(self, fileno, total):
         """Updates the file number (i.e. number of current file/total
         files loaded)."""
@@ -97,10 +92,6 @@ class Statusbar(Gtk.EventBox):
             self._file_info = '(%d / %d)' % (fileno, total)
         else:
             self._file_info = ''
-
-    def get_file_number(self):
-        """ Returns the bar's file information."""
-        return self._file_info
 
     def set_resolution(self, dimensions): # 2D only
         """Update the resolution data.
@@ -121,7 +112,7 @@ class Statusbar(Gtk.EventBox):
 
     def set_root(self, root):
         """Set the name of the root (directory or archive)."""
-        self._root = i18n.to_display_string(i18n.to_unicode(root))
+        self._root = i18n.to_display_string(root)
 
     def set_filename(self, filename):
         """Update the filename."""

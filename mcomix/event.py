@@ -407,34 +407,34 @@ class EventHandler(object):
                            Gdk.ModifierType.MOD1_MASK)
 
         keymap = Gdk.Keymap.get_default()
+        state = event.get_state()
         code = keymap.translate_keyboard_state(
-                event.hardware_keycode, event.get_state(), event.group)
+                event.hardware_keycode, state, event.group)
 
         if code[0]:
             keyval = code[1]
             # 'consumed' is the modifier that was necessary to type the key
             consumed = code[4]
 
-            if event.get_state() & Gdk.ModifierType.SHIFT_MASK:
+            if state & Gdk.ModifierType.SHIFT_MASK:
                 # If the resulting key is upper case (i.e. SHIFT + key),
                 # convert it to lower case and remove SHIFT from the consumed flags
                 # to match how keys are registered (<Shift> + lowercase)
                 if keyval != Gdk.keyval_to_lower(keyval):
                     keyval = Gdk.keyval_to_lower(keyval)
                     consumed &= ~Gdk.ModifierType.SHIFT_MASK
-                # If lower/upper case conversion with SHIFT is not applicable to the key pressed,
-                # i.e. Space and other special keys, remove SHIFT from the consumed mask.
-                if Gdk.keyval_to_upper(keyval) == Gdk.keyval_to_lower(keyval):
+                # A key Shift doesn't change (Space, Page_Up, a letter under
+                # Caps Lock) keeps Shift as a modifier. A key the layout types
+                # with Shift (AZERTY Shift+à types 0) consumes it, so
+                # Ctrl+Shift+à is <Control>0.
+                elif keyval == Gdk.keyval_to_lower(keymap.translate_keyboard_state(
+                        event.hardware_keycode, state & ~Gdk.ModifierType.SHIFT_MASK,
+                        event.group)[1]):
                     consumed &= ~Gdk.ModifierType.SHIFT_MASK
+                else:
+                    consumed |= Gdk.ModifierType.SHIFT_MASK
 
             manager.execute((keyval, event.get_state() & ~consumed & ALL_ACCELS_MASK))
-
-        # ---------------------------------------------------------------
-        # Register CTRL for scrolling only one page instead of two
-        # pages in double page mode. This is mainly for mouse scrolling.
-        # ---------------------------------------------------------------
-        if event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
-            self._window.imagehandler.force_single_step = True
 
         # ----------------------------------------------------------------
         # We kill the signals here for the Up, Down, Space and Enter keys,
@@ -449,15 +449,6 @@ class EventHandler(object):
 
             self._window.emit_stop_by_name('key_press_event')
             return True
-
-    def key_release_event(self, widget, event, *args):
-        """ Handle release of keys for the main window. """
-
-        # ---------------------------------------------------------------
-        # Unregister CTRL for scrolling only one page in double page mode
-        # ---------------------------------------------------------------
-        if event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
-            self._window.imagehandler.force_single_step = False
 
     def escape_event(self):
         """ Determines the behavior of the ESC key. """
@@ -574,8 +565,6 @@ class EventHandler(object):
     def mouse_move_event(self, widget, event):
         """Handle mouse pointer movement events."""
 
-        event = _get_latest_event_of_same_type(event)
-
         if 'GDK_BUTTON1_MASK' in event.get_state().value_names:
             self._window.cursor_handler.set_cursor_type(constants.GRAB_CURSOR)
             scrolled = self._window.scroll(self._last_pointer_pos_x - event.x_root,
@@ -595,16 +584,12 @@ class EventHandler(object):
                 if (new_x != event.x_root) or (new_y != event.y_root):
                     display = screen.get_display()
                     display.warp_pointer(screen, int(new_x), int(new_y))
-                    ## This might be (or might not be) necessary to avoid
-                    ## doing one warp multiple times.
-                    event = _get_latest_event_of_same_type(event)
 
                 self._last_pointer_pos_x = new_x
                 self._last_pointer_pos_y = new_y
             else:
                 self._last_pointer_pos_x = event.x_root
                 self._last_pointer_pos_y = event.y_root
-            self._drag_timer = event.time
 
     def drag_n_drop_event(self, widget, context, x, y, selection, drag_id,
       eventtime):
@@ -716,13 +701,9 @@ class EventHandler(object):
             self._flip_page(1)
             return True
 
-        elif (self._scroll_protection):
+        else:
             self._extra_scroll_events = max(1, self._extra_scroll_events + 1)
             return False
-
-        else:
-            # This path should not be reached.
-            assert False, "Programmer is moron, incorrect assertion."
 
     def _previous_page_with_protection(self):
         """ Goes back to the previous page. If L{_scroll_protection} is enabled,
@@ -741,13 +722,9 @@ class EventHandler(object):
             self._flip_page(-1)
             return True
 
-        elif (self._scroll_protection):
+        else:
             self._extra_scroll_events = min(-1, self._extra_scroll_events - 1)
             return False
-
-        else:
-            # This path should not be reached.
-            assert False, "Programmer is moron, incorrect assertion."
 
 
     def _flip_page(self, number_of_pages, single_step=False):
@@ -769,30 +746,6 @@ class EventHandler(object):
         commands = [cmd for cmd in manager.get_commands() if not cmd.is_separator()]
         if len(commands) > cmdindex:
             commands[cmdindex].execute(self._window)
-
-
-def _get_latest_event_of_same_type(event):
-    """Return the latest event in the event queue that is of the same type
-    as <event>, or <event> itself if no such events are in the queue. All
-    events of that type will be removed from the event queue.
-    """
-    return event
-    events = []
-
-    while Gdk.events_pending():
-        queued_event = Gdk.event_get()
-
-        if queued_event is not None:
-
-            if queued_event.type == event.type:
-                event = queued_event
-            else:
-                events.append(queued_event)
-
-    for queued_event in events:
-        queued_event.put()
-
-    return event
 
 
 def _valwarp(cur, maxval, minval=0, tolerance=3, extra=2):

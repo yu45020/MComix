@@ -1,114 +1,171 @@
-"""Manager code for spawned processes in multiprocessing implementation
-of PDF extractor."""
+"""A serialized, spawned PDF worker with one document per archive."""
 
-import sys
-import threading
 import multiprocessing as mp
-from multiprocessing.managers import BaseManager, BaseProxy
-
-from typing import Optional, Generator
+import threading
+from multiprocessing.util import Finalize
+from typing import Any, Generator, Iterable
 
 from .child import MuPDFWorker
 
 
-class GeneratorProxy(BaseProxy):
-    """Proxy type for generator objects."""
+def _serve(connection: Any, filename: str) -> None:
+    """Own the document and run all MuPDF operations on one child thread."""
+    worker = None
+    try:
+        try:
+            worker = MuPDFWorker(filename)
+            connection.send((True, None))
+        except Exception as error:
+            connection.send((False, str(error)))
+            return
+        while True:
+            command, args = connection.recv()
+            try:
+                if command == 'close':
+                    worker.close()
+                    worker = None
+                    connection.send((True, None))
+                    return
+                if command == 'list_pages':
+                    result = worker.list_pages(*args)
+                elif command == 'extract_file':
+                    worker.extract_file(*args)
+                    result = None
+                else:
+                    raise ValueError('Unknown PDF worker command: %s' % command)
+                connection.send((True, result))
+            except Exception as error:
+                # MuPDF exception classes are not consistently picklable across
+                # supported versions. Keep errors usable without losing the pipe.
+                connection.send((False, str(error)))
+    except (EOFError, BrokenPipeError):
+        pass
+    finally:
+        if worker is not None:
+            worker.close()
+        connection.close()
 
-    _exposed_ = ['__next__']
 
-    def __iter__(self):
-        return self
+def _terminate(process: Any, connection: Any) -> None:
+    """Release an abandoned child without retaining its archive owner."""
+    connection.close()
+    if process.is_alive():
+        process.terminate()
+    process.join()
 
-    def __next__(self):
-        return self._callmethod('__next__')
 
+class MuPDFProcessWrangler:
+    """Share one serialized child/document between an archive's callers.
 
-class WorkerProxy(BaseProxy):
-    """Proxy type for MuPDFWorker methods.
-
-    This code will run in the child processes, when triggered by
-    the registered methods of the Manager.
+    A manager server dispatches calls on multiple threads, which is unsafe for
+    a shared MuPDF document. This worker instead handles the pipe on its main
+    thread. Constructing the wrangler does not start a process or open a PDF.
     """
 
-    filename: Optional[str] = None
+    def __init__(self, filename: str) -> None:
+        self._filename = filename
+        self._lock = threading.RLock()
+        self._process = None
+        self._connection = None
+        self._finalizer = None
+        self._closed = False
 
-    @classmethod
-    def _open(cls, filename):
-        cls.filename = filename
+    def _start(self) -> None:
+        """Start and initialize a child while holding the request lock."""
+        context = mp.get_context('spawn')
+        connection, child_connection = context.Pipe()
+        process = context.Process(target=_serve,
+                                  args=(child_connection, self._filename),
+                                  name='mcomix-pdf')
+        try:
+            process.start()
+        except BaseException:
+            connection.close()
+            raise
+        finally:
+            child_connection.close()
+        self._process = process
+        self._connection = connection
+        self._finalizer = Finalize(self, _terminate,
+                                   args=(process, connection), exitpriority=10)
+        try:
+            self._receive()
+        except (EOFError, OSError) as error:
+            self._dispose()
+            raise RuntimeError('PDF worker failed to start') from error
+        except BaseException:
+            self._dispose()
+            raise
 
-    @classmethod
-    def _count_pages(cls) -> int:
-        w = MuPDFWorker(cls.filename)
-        return w.page_count()
+    def _receive(self) -> Any:
+        """Receive one result, including failures from opening the document."""
+        success, result = self._connection.recv()
+        if not success:
+            raise RuntimeError('PDF worker failed: %s' % result)
+        return result
 
-    @classmethod
-    def _list_pages(cls) -> Generator[str, None, None]:
-        w = MuPDFWorker(cls.filename)
-        return w.iter_contents()
+    def _dispose(self) -> None:
+        """Finish the owned process and remove its finalizer."""
+        if self._finalizer is not None:
+            self._finalizer()
+        self._finalizer = None
+        self._connection = None
+        self._process = None
 
-    @classmethod
-    def _extract_pages(cls, entries, save_path: str) -> Generator[str, None, None]:
-        w = MuPDFWorker(cls.filename)
-        for e in entries:
-            w.extract_file(e, save_path)
-            yield e
-
-
-class MuPDFManager(BaseManager):
-    """Multiprocessing manager to hold proxied worker callables."""
-
-    pass
-
-
-MuPDFManager.register("open", WorkerProxy._open)
-MuPDFManager.register("page_count", WorkerProxy._count_pages)
-MuPDFManager.register(
-    "iter_contents", WorkerProxy._list_pages, proxytype=GeneratorProxy
-)
-MuPDFManager.register(
-    "extract_pages", WorkerProxy._extract_pages, proxytype=GeneratorProxy
-)
-
-
-class MuPDFProcessWrangler(threading.local):
-    """Thread-local state object holding a MuPDFManager instance.
-
-    This is necessary so that each Mcomix extractor thread has its own
-    MuPDFManager instance (and, therefore, its own worker process).
-    """
-
-    def __init__(self, filename, log_level):
-        self.mgr = MuPDFManager()
-        self.mgr.start()
-        self.mgr.open(filename)
-        self.log = mp.get_logger()
-        if log_level is not None:
-            self.log.setLevel(log_level)
-
-    def page_count(self) -> int:
-        """Get the number of pages in the PDF."""
-        return self.mgr.page_count()
+    def _request(self, command: str, *args: Any) -> Any:
+        """Serialize complete requests; never share MuPDF objects with GTK."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('PDF worker is closed')
+            if self._process is None:
+                self._start()
+            try:
+                self._connection.send((command, args))
+                return self._receive()
+            except (EOFError, OSError) as error:
+                self._dispose()
+                raise RuntimeError('PDF worker stopped unexpectedly') from error
 
     def iter_contents(self) -> Generator[str, None, None]:
-        """Return an iterator over all the page filenames in the PDF."""
-        return self.mgr.iter_contents()
+        """List pages with one request, leaving no remote generator behind."""
+        offset = 0
+        while True:
+            pages = self._request('list_pages', offset, 128)
+            yield from pages
+            if len(pages) < 128:
+                return
+            offset += len(pages)
 
-    def extract_pages(self, page_list, destination_dir) -> Generator[str, None, None]:
-        """Extract the listed pages to the given directory."""
-        return self.mgr.extract_pages(page_list, destination_dir)
+    def extract_pages(self, page_list: Iterable[str],
+                      destination_dir: str) -> Generator[str, None, None]:
+        """Publish each successful page while reusing the open document."""
+        for filename in page_list:
+            self._request('extract_file', filename, destination_dir)
+            yield filename
 
+    def terminate(self) -> None:
+        """Fail pending and later requests by ending the child, without the
+        request lock a blocked request holds."""
+        self._closed = True
+        process = self._process
+        if process is not None and process.is_alive():
+            process.terminate()
 
-# Test code, this module can be called directly with one argument (a PDF
-# filename), and will print a list of all pages in the PDF (produced by
-# a spawned MuPDFWorker process)
-if __name__ == "__main__":
-    mp.freeze_support()
-    mp.set_start_method('spawn')
-    infile = sys.argv[1]
-    import logging
-
-    wrangler = MuPDFProcessWrangler(infile, log_level=logging.DEBUG)
-
-    print(f"All pages in PDF {infile}:")
-    for file in wrangler.iter_contents():
-        print(f"  {file}")
+    def close(self) -> None:
+        """Wait for active requests, close the document, and join its child."""
+        with self._lock:
+            if self._closed:
+                # Join a child that terminate() ended while idle.
+                self._dispose()
+                return
+            self._closed = True
+            try:
+                if self._process is not None:
+                    self._connection.send(('close', ()))
+                    self._receive()
+                    self._process.join()
+            except (EOFError, OSError):
+                # A crashed child has already released its document handles.
+                pass
+            finally:
+                self._dispose()

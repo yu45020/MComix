@@ -63,7 +63,9 @@ class _CommentArea(Gtk.Box):
           self._edit_dialog.file_handler.get_number_of_comments() + 1):
 
             path = self._edit_dialog.file_handler.get_comment_name(num)
-            size = tools.format_byte_size(os.stat(path).st_size)
+            # The file might not exist (yet): archives can be read on demand.
+            size = self._edit_dialog.file_handler.get_file_size(path)
+            size = '' if size is None else tools.format_byte_size(size)
             self._liststore.append([os.path.basename(path), size, path])
 
     def add_extra_file(self, path):
@@ -93,8 +95,6 @@ class _CommentArea(Gtk.Box):
 
         if path is None:
             return
-
-        path = path[0]
 
         if event.button == 3:
             self._ui_manager.get_widget('/Popup').popup(None, None, None, None,

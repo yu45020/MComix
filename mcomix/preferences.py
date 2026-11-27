@@ -3,11 +3,9 @@ write them.  """
 
 import json
 import os
-import pickle
-import shutil
-import sys
 
 from mcomix import constants
+from mcomix.atomic_file import atomic_write
 
 # All the preferences are stored here.
 prefs = {
@@ -15,6 +13,7 @@ prefs = {
     'auto load last file': False,
     'page of last file': 1,
     'path to last file': '',
+    'image of last file': '',
     'number of key presses before page turn': 3,
     'auto open next archive': True,
     'auto open next directory': True,
@@ -28,9 +27,7 @@ prefs = {
     'thumb bg colour': [5000, 5000, 5000],
     'smart bg': False,
     'smart thumb bg': False,
-    'thumbnail bg uses main colour': False,
     'checkered bg for transparent images': True,
-    'cache': True,
     'stretch': False,
     'default double page': False,
     'default fullscreen': False,
@@ -57,12 +54,11 @@ prefs = {
     'store recent file info': True,
     'hide all': False,
     'hide all in fullscreen': True,
-    'stored hide all values': [True, True, True, True, True],
     'path of last browsed in filechooser': constants.HOME_DIR,
     'store last saved in directory': True,
     'path of last saved in filechooser': constants.HOME_DIR,
     'last filter in main filechooser': 0,
-    'last filter in library filechooser': 1,
+    'last filter in library filechooser': 0,
     'show menubar': True,
     'previous quit was quit and save': False,
     'show scrollbar': True,
@@ -101,8 +97,14 @@ prefs = {
                         constants.STATUS_PATH | constants.STATUS_FILENAME | constants.STATUS_FILESIZE,
     'max threads': 3,
     'max extract threads': 1,
+    'lazy archive reading': True,
     'wrap mouse scroll': False,
     'scaling quality': 2,  # GdkPixbuf.InterpType.BILINEAR
+    'neural upscaling': False,
+    'neural upscaling model': '',  # ONNX model path; '' = bundled default
+    'neural upscaling max input size': 2048,  # Only pages smaller than this
+    'neural upscaling always': False,  # Also when the page is not enlarged
+    'neural upscaling runtime': 'auto',  # 'auto' (faster Windows ML provider if any) or 'directml'
     'escape quits': False,
     'fit to size width wide': 3790,
     'fit to size height wide': 960,
@@ -111,78 +113,76 @@ prefs = {
     'scan for new books on library startup': True,
     'openwith commands': [],  # (label, command) pairs
     'animation mode': constants.ANIMATION_NORMAL,
+    'animation cache limit': 128,  # MiB shared by visible WebP animations
+    'enlarge animated webp': True,
+    'animated webp max size': 2048,  # Longest display edge in pixels; 0 is unlimited
     'double page autoresize': constants.DOUBLE_PAGE_AUTORESIZE_SIZE,
     'space between two pages': 2,
 }
 
 
-def migrate_home_config_path() -> None:
-    """ Migrate the old configuration directory in the user's
-    home directory to %APPDATA% on Win32, if the directory
-    doesn't already exist. """
-    if sys.platform == "win32":
-        old_config_dir = os.path.join(os.path.expanduser("~"), "MComix")
-        if os.path.isdir(old_config_dir) and not os.path.isdir(constants.CONFIG_DIR):
-            shutil.move(old_config_dir, constants.CONFIG_DIR)
+#: Loaded values outside these ranges (the Preferences spinners' limits)
+#: break scrolling, so the default is kept instead.
+_RANGES = {
+    'smart scroll percentage': (0.01, 1.0),
+    'number of pixels to scroll per mouse wheel event': (1, 500),
+}
+
+#: False when preferences.conf couldn't be read; the run then keeps it.
+_file_readable = True
 
 
 def read_preferences_file() -> None:
     """Read preferences data from disk."""
-
-    saved_prefs = None
-
-    migrate_home_config_path()
-
-    if os.path.isfile(constants.PREFERENCE_PATH):
+    global _file_readable
+    path = constants.PREFERENCE_PATH
+    if not os.path.isfile(path):
+        return
+    # Gettext might not be installed yet at this point, so messages are
+    # printed untranslated.
+    try:
+        with open(path, 'rb') as config_file:
+            text = config_file.read()
+    except OSError as error:
+        print('! Could not read preferences file "%s": %s' % (path, error))
+        _file_readable = False
+        return
+    try:
+        saved_prefs = json.loads(text)
+    except ValueError:
+        saved_prefs = None
+    if not isinstance(saved_prefs, dict):
+        corrupt_name = path + '.broken'
+        print('! Corrupt preferences file, moving to "%s".' % corrupt_name)
         try:
-            config_file = open(constants.PREFERENCE_PATH, 'r')
-            saved_prefs = json.load(config_file)
-            config_file.close()
-        except:
-            # Gettext might not be installed yet at this point.
-            corrupt_name = "%s.broken" % constants.PREFERENCE_PATH
-            print(('! Corrupt preferences file, moving to "%s".' %
-                   corrupt_name))
-            if os.path.isfile(corrupt_name):
-                os.unlink(corrupt_name)
+            os.replace(path, corrupt_name)
+        except OSError as error:
+            print('! Could not move preferences file: %s' % error)
+            _file_readable = False
+        return
 
-            try:
-                # File cannot be moved without closing it first
-                config_file.close()
-            except:
-                pass
+    for key, value in saved_prefs.items():
+        if key not in prefs:
+            continue
+        if key in _RANGES:
+            low, high = _RANGES[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not low <= value <= high:
+                continue
+        prefs[key] = value
 
-            os.rename(constants.PREFERENCE_PATH, corrupt_name)
-
-    elif os.path.isfile(constants.PREFERENCE_PICKLE_PATH):
-        try:
-            config_file = open(constants.PREFERENCE_PICKLE_PATH, 'rb')
-            version = pickle.load(config_file)
-            saved_prefs = pickle.load(config_file)
-            config_file.close()
-
-            # Remove legacy format preferences file
-            os.unlink(constants.PREFERENCE_PICKLE_PATH)
-        except Exception:
-            # Gettext might not be installed yet at this point.
-            print(('! Corrupt legacy preferences file "%s", ignoring...' %
-                   constants.PREFERENCE_PICKLE_PATH))
-
-    if saved_prefs:
-        for key in saved_prefs:
-            if key in prefs:
-                prefs[key] = saved_prefs[key]
 
 def write_preferences_file():
-    """Write preference data to disk."""
+    """Write preference data to disk, unless the file couldn't be read."""
+    if not _file_readable:
+        return
     # TODO: it might be better to save only those options that were (ever)
     # explicitly changed by the used, leaving everything else as default
     # and available (if really needed) to change of defaults on upgrade.
-    config_file = open(constants.PREFERENCE_PATH, 'w')
     # XXX: constants.VERSION? It's *preferable* to not complicate the YAML
     # file by adding a `{'version': constants.VERSION, 'prefs': config}`
     # dict or a list.  Adding an extra init line sounds bad too.
-    json.dump(prefs, config_file, indent=2)
-    config_file.close()
+    with atomic_write(constants.PREFERENCE_PATH) as config_file:
+        json.dump(prefs, config_file, indent=2)
 
 # vim: expandtab:sw=4:ts=4

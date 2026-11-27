@@ -32,7 +32,7 @@ class OnScreenDisplay(object):
 
         # Determine text to draw
         text = self._wrap_text(text)
-        layout = self._window._image_box.create_pango_layout(text)
+        layout = self._window._main_layout.create_pango_layout(text)
 
         # Set up font information
         font = layout.get_context().get_font_description()
@@ -119,13 +119,8 @@ class OnScreenDisplay(object):
             last_region.x, last_region.y, last_region.width, last_region.height = self._last_osd_rect
             draw_region = Gdk.rectangle_union(draw_region, last_region)
 
-        gdk_rect = Gdk.Rectangle()
-        gdk_rect.x = draw_region.x
-        gdk_rect.y = draw_region.y
-        gdk_rect.width = draw_region.width
-        gdk_rect.height = draw_region.height
         window = self._window._main_layout.get_bin_window()
-        window.begin_paint_rect(gdk_rect)
+        window.begin_paint_rect(draw_region)
 
         self._clear_osd()
 

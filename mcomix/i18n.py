@@ -21,25 +21,25 @@ from mcomix import constants
 _translation = None
 
 def to_unicode(string):
-    """Convert <string> to unicode. First try the default filesystem
-    encoding, and then fall back on some common encodings.
+    """Convert <string> to unicode. First try chardet's guess, and then
+    fall back on some common encodings.
     """
     if isinstance(string, str):
         return string
 
-    # Try chardet heuristic
-    if chardet:
-        probable_encoding = chardet.detect(string)['encoding'] or \
-            locale.getpreferredencoding() # Fallback if chardet detection fails
-    else:
-        probable_encoding = locale.getpreferredencoding()
+    probable_encoding = chardet.detect(string)['encoding'] if chardet else None
 
+    # Strict UTF-8 rarely decodes other encodings by accident, so it goes
+    # before the locale's guess (cp936 would turn UTF-8 'é' into '茅').
     for encoding in (
         probable_encoding,
-        sys.getfilesystemencoding(),
         'utf-8',
+        locale.getpreferredencoding(),
+        sys.getfilesystemencoding(),
         'latin-1'):
 
+        if encoding is None:
+            continue
         try:
             ustring = str(string, encoding)
             return ustring
@@ -63,10 +63,6 @@ def install_gettext(force_lang=None):
     """ Initialize gettext with the correct directory that contains
     MComix translations. This has to be done before any calls to gettext.gettext
     have been made to ensure all strings are actually translated. """
-
-    # Add the sources' base directory to PATH to allow development without
-    # explicitly installing the package.
-    sys.path.append(constants.BASE_PATH)
 
     # Initialize default locale
     locale.setlocale(locale.LC_ALL, '')

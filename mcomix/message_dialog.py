@@ -2,7 +2,9 @@
     supports remembering the dialog result.
 """
 
-from gi.repository import Gtk
+from typing import Optional
+
+from gi.repository import GLib, Gtk
 
 from mcomix.preferences import prefs
 from mcomix.i18n import _
@@ -35,16 +37,18 @@ class MessageDialog(Gtk.MessageDialog):
         self.remember_checkbox.set_can_focus(False)
         self.get_message_area().pack_end(self.remember_checkbox, True, True, 6)
 
-    def set_text(self, primary, secondary=None):
-        """ Formats the dialog's text fields.
+    def set_text(self, primary: str, secondary: Optional[str] = None) -> None:
+        """Format plain text safely, keeping the heading bold.
+
+        Use GTK's explicit markup methods when intentional markup is needed.
         @param primary: Main text.
         @param secondary: Descriptive text.
         """
         if primary:
             self.set_markup('<span weight="bold" size="larger">' +
-                primary + '</span>')
+                GLib.markup_escape_text(primary) + '</span>')
         if secondary:
-            self.format_secondary_markup(secondary)
+            self.format_secondary_text(secondary)
 
     def should_remember_choice(self):
         """ Returns True when the dialog choice should be remembered. """

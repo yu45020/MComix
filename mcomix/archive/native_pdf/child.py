@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import io
 import os
-import multiprocessing as mp
-from PIL import Image, ExifTags
-from typing import Generator, Optional
+import re
+from PIL import Image
+from typing import Generator, List, Optional
 
 try:
     import pymupdf
@@ -23,22 +23,27 @@ XREF_DELIMITER = '_mcmxref'
 
 
 class MuPDFWorker:
-    def __init__(self, filename: Optional[str], log_level: Optional[int] = None) -> None:
-        self._extension: Optional[str] = None
+    def __init__(self, filename: Optional[str]) -> None:
         self._complex_doc = False
-        self.log = mp.get_logger()
-        if log_level is not None:
-            self.log.setLevel(log_level)
+        self._contents = []
+        self._page_iterator = None
+        self._listing_finished = False
+        self._listing_error = None
         self.doc = pymupdf.open(filename)
 
-    def page_count(self) -> int:
-        return self.doc.page_count
+    def close(self) -> None:
+        """Release the document before its child process exits."""
+        if self._page_iterator is not None:
+            self._page_iterator.close()
+            self._page_iterator = None
+        self.doc.close()
 
     def _image_extension(self, page_num: int) -> str:
         """Return the filename extension for the page image."""
-        if self._extension is None:
-            self._extension = self._check_image_type(page_num)
-        return self._extension
+        # Rotated images are saved losslessly after applying page rotation.
+        if self.doc[page_num].rotation:
+            return 'png'
+        return self._check_image_type(page_num)
 
     def _extract_as_image(self, page_num: int) -> bool:
         """Check whether the page can be extracted via image export."""
@@ -60,10 +65,8 @@ class MuPDFWorker:
         if len(page.get_images()) != 1 or len(page.get_text()) > 0:
             self._complex_doc = True
             result = True
-            self.log.debug("PDF page %d, must render page", page_num + 1)
         else:
             result = False
-            self.log.debug("PDF page %d, rendering not forced", page_num + 1)
         del page
         return result
 
@@ -74,17 +77,10 @@ class MuPDFWorker:
         by checking whether the page contains a single, full-page
         image, then actually extracting the first such image
         encountered to determine the filetype (extension).
-
-        (Subsequent embedded images are assumed to have the same
-        type as the first full-page image encountered. This may
-        be somewhat fragile, but it's a huge performance boost.)
         """
         page = self.doc[page_num]
         image_info = page.get_image_info()
         if len(image_info) != 1:
-            self.log.debug(
-                "PDF page %d, cannot extract. Image count = %d",
-                page_num + 1, len(image_info))
             return False
         info = image_info[0]
         img_rect = pymupdf.Rect(info.get("bbox", (0, 0, 0, 0))).irect
@@ -92,12 +88,6 @@ class MuPDFWorker:
         page_area = page_rect.get_area()
         area_diff = abs(page_area - img_rect.get_area())
         is_full_page: bool = area_diff < 0.05 * page_area
-        if is_full_page:
-            self.log.debug('PDF page %d: can extract fullpage image', page_num + 1)
-        else:
-            self.log.debug(
-                'PDF page %d, cannot extract image: %s',
-                page_num + 1, f"img_rect={img_rect}, page_rect={page_rect}")
         del page
         del image_info
         return is_full_page
@@ -105,16 +95,8 @@ class MuPDFWorker:
     def _check_image_type(self, page_num: int) -> str:
         """Examine the page's embedded image for its file type.
 
-        The extension is determined heuristically by probing only the
-        first page of the document for an embedded image, then using
-        its type.
-
-        If the first page does have a single embedded image, it's
-        assumed that _all_ pages contain an image of the same type.
-        This may be a fragile assumption.
-
-        If the probe fails, 'png' is used as a fallback, as that's the
-        type rendered page pixmaps will be saved with.
+        Probe each embedded image because one PDF can mix image formats.
+        Unknown raw formats are converted to PNG by Document.extract_image.
         """
         extension = 'png'
         try:
@@ -130,9 +112,12 @@ class MuPDFWorker:
                 extension = img.get('ext', 'png')
                 del img
         except (AttributeError, TypeError):
-            pass
-        finally:
-            return extension
+            # Some PyMuPDF releases cannot probe raw Python byte streams.
+            # Ask the extractor for the authoritative format in that case.
+            image = self.doc.extract_image(xref)
+            if image:
+                extension = image.get('ext', 'png')
+        return extension
 
     def _get_image_xref(self, page_num: int) -> int:
         try:
@@ -145,6 +130,7 @@ class MuPDFWorker:
             image_info = None
 
     def iter_contents(self) -> Generator[str, None, None]:
+        self._complex_doc = False
         for pg in range(self.doc.page_count):
             pagenum = f"page{pg + 1:04}"
             if self._extract_as_image(pg):
@@ -155,6 +141,26 @@ class MuPDFWorker:
                 filename = f"{pagenum}.png"
             yield filename
 
+    def list_pages(self, offset: int, limit: int) -> List[str]:
+        """Keep identifiers stable across calls and send bounded IPC batches."""
+        if self._listing_error is not None:
+            raise RuntimeError(self._listing_error)
+        if self._page_iterator is None and not self._listing_finished:
+            self._page_iterator = self.iter_contents()
+        while len(self._contents) < offset + limit and not self._listing_finished:
+            try:
+                self._contents.append(next(self._page_iterator))
+            except StopIteration:
+                self._page_iterator = None
+                self._listing_finished = True
+            except Exception as error:
+                # A failed iterator must not turn into a successful partial
+                # listing when another caller asks for the same document.
+                self._page_iterator = None
+                self._listing_error = str(error)
+                raise
+        return self._contents[offset:offset + limit]
+
     def extract_xref(self, page: int, xref: int, path: str) -> None:
         """Save the embedded PDF image for a given xref. The page is indexed starting with zero."""
         img = self.doc.extract_image(xref)
@@ -164,25 +170,25 @@ class MuPDFWorker:
         img_bytes = img.get("image", b"")
         del img
 
-        # The extract_image method always returns the unrotated version of the image,
-        # unaffected by any page modifications of rotation.
-        EXIF_ROTS = {
-            90: 6,
-            180: 3,
-            270: 8,
-        }
+        # Applying PDF rotation must not re-encode embedded JPEGs at a
+        # lower quality. Rotate decoded pixels into a lossless PNG instead.
         rotation = self.doc[page].rotation
-        if rotation in EXIF_ROTS.keys():
-            # Embed rotation in image as EXIF data
-            buffer = io.BytesIO(img_bytes)
-            with Image.open(buffer) as pil_img:
-                exif_data = pil_img.getexif()
-                exif_data[ExifTags.Base.Orientation] = EXIF_ROTS[rotation]
-                pil_img.save(path, exif=exif_data)
-            del buffer
-
+        if rotation:
+            with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                rotated = pil_img.rotate(-rotation, expand=True)
+                try:
+                    if rotated.mode not in ('1', 'L', 'LA', 'P', 'RGB', 'RGBA', 'I', 'I;16'):
+                        converted = rotated.convert('RGB')
+                        rotated.close()
+                        rotated = converted
+                    # PDF rotation has already been applied to the pixels.
+                    # Do not propagate an embedded orientation tag as well.
+                    rotated.info.pop('exif', None)
+                    rotated.save(path, format='PNG')
+                finally:
+                    rotated.close()
         else:
-            with open(path, "wb") as out:
+            with open(path, 'wb') as out:
                 out.write(img_bytes)
         del img_bytes
 
@@ -195,12 +201,12 @@ class MuPDFWorker:
         del page
 
     def extract_file(self, filename: str, dest: str) -> None:
+        match = re.fullmatch(r'page([0-9]+)(?:' + XREF_DELIMITER + r'([0-9]+))?\.([a-z0-9]+)', filename)
+        if match is None or int(match.group(1)) < 1:
+            raise ValueError('Invalid PDF page name: %s' % filename)
         outpath = os.path.join(dest, filename)
-        if XREF_DELIMITER in filename:
-            pginfo, ref = filename.split(XREF_DELIMITER)
-            page = int(pginfo[-4:]) - 1
-            xref = int(ref[:4])
-            self.extract_xref(page, xref, outpath)
-        elif filename.startswith('page'):
-            pg_num = int(filename[4:8]) - 1
-            self.render_page(pg_num, outpath)
+        page = int(match.group(1)) - 1
+        if match.group(2) is not None:
+            self.extract_xref(page, int(match.group(2)), outpath)
+        else:
+            self.render_page(page, outpath)

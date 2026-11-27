@@ -9,8 +9,7 @@ import os
 import re
 import sys
 from functools import reduce
-from typing import (Any, Iterable, List, Mapping, Sequence, Tuple, TypeVar,
-                    Union)
+from typing import Any, List, Mapping, Sequence, TypeVar, Union
 
 Numeric = TypeVar('Numeric', int, float)
 
@@ -27,7 +26,7 @@ class AlphanumericSortKey:
     """ Compares two strings by their natural order (i.e. 1 before 10) """
     def __init__(self, filename: str) -> None:
         self.filename_parts: List[Union[int, str]] = [
-            int(part) if part.isdigit() else part
+            int(part) if part.isdecimal() else part
             for part in NUMERIC_REGEXP.findall(filename.lower())
         ]
 
@@ -73,14 +72,8 @@ def bin_search(lst: List, value: Any) -> int:
 
 
 def get_home_directory() -> str:
-    """On UNIX-like systems, this method will return the path of the home
-    directory, e.g. /home/username. On Windows, it will return an MComix
-    sub-directory of <Documents and Settings/Username>.
-    """
-    if sys.platform == 'win32':
-        return os.path.join(os.path.expanduser('~'), 'MComix')
-    else:
-        return os.path.expanduser('~')
+    """Return the user's home folder, e.g. /home/username or C:\\Users\\username."""
+    return os.path.expanduser('~')
 
 
 def get_config_directory() -> str:
@@ -136,22 +129,13 @@ def number_of_digits(n: int) -> int:
     return int(math.log10(abs(n))) + 1
 
 
-def decompose_byte_size_exponent(n: float) -> Tuple[float, int]:
+def format_byte_size(n: float) -> str:
     e = 0
     while n > 1024.0:
         n /= 1024.0
         e += 1
-    return (n, e)
-
-
-def byte_size_exponent_to_prefix(e: int) -> str:
-    return PREFIXED_BYTE_UNITS[min(e, len(PREFIXED_BYTE_UNITS) - 1)]
-
-
-def format_byte_size(n: float) -> str:
-    nn, e = decompose_byte_size_exponent(n)
-    return ('%d %s' if nn == int(nn) else '%.1f %s') % \
-        (nn, byte_size_exponent_to_prefix(e))
+    return ('%d %s' if n == int(n) else '%.1f %s') % \
+        (n, PREFIXED_BYTE_UNITS[min(e, len(PREFIXED_BYTE_UNITS) - 1)])
 
 
 def garbage_collect() -> None:
@@ -206,30 +190,20 @@ def remap_axes(vector, order):
     return [vector[i] for i in order]
 
 
-def inverse_axis_map(order):
-    identity = list(range(len(order)))
-    return [identity[order[i]] for i in identity]
-
-
-def compile_rotations(*rotations):
-    return reduce(lambda a, x: a + (x % 360) % 360, rotations, 0)
+def compile_rotations(*rotations: int) -> int:
+    """Compose rotations into a single clockwise angle below one full turn."""
+    return sum(rotations) % 360
 
 
 def rotation_swaps_axes(rotation: int) -> bool:
     return rotation in (90, 270)
 
 
-def fixed_strings_regex(strings: Iterable[str]) -> str:
-    # introduces a matching group
-    unique_strings = set(strings)
-    return r'(%s)' % '|'.join(sorted([re.escape(s) for s in unique_strings]))
-
-
 def formats_to_regex(formats: Mapping) -> re.Pattern:
     """ Returns a compiled regular expression that can be used to search for
     file extensions specified in C{formats}. """
-    return re.compile(r'\.' + fixed_strings_regex(
-        itertools.chain.from_iterable([e[1] for e in formats.values()])) + r'$', re.I)
+    extensions = set(itertools.chain.from_iterable([e[1] for e in formats.values()]))
+    return re.compile(r'\.(%s)$' % '|'.join(sorted(map(re.escape, extensions))), re.I)
 
 
 def append_number_to_filename(filename: str, number: int) -> str:

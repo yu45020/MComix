@@ -1,6 +1,8 @@
 """enhance_backend.py - Image enhancement handler and dialog (e.g. contrast,
 brightness etc.)
 """
+from typing import Tuple
+
 from gi.repository import GLib
 
 from mcomix.preferences import prefs
@@ -22,6 +24,11 @@ class ImageEnhancer(object):
         self.sharpness = prefs['sharpness']
         self.autocontrast = prefs['auto contrast']
         self.invert_color = prefs['invert color']
+
+    def settings_key(self) -> Tuple[float, float, float, float, bool, bool]:
+        """Return every setting that can change enhanced pixels."""
+        return (self.brightness, self.contrast, self.saturation,
+                self.sharpness, self.autocontrast, self.invert_color)
 
     def enhance(self, pixbuf):
         """Return an "enhanced" version of <pixbuf>."""

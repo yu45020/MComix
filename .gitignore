@@ -1,15 +1,44 @@
 *.pyc
 __pycache__
-win32/*.nupkg
 *.egg-info/
 build/
 dist/
 env/
 install/
 tags*
+.idea/*
+.vscode/*
 
 # Tools for archive extraction
 mutool.exe
-UnRAR64.dll
 7z.dll
 7z.exe
+.venv/
+.tmp/
+.claude/worktrees/
+.codex_worktrees/
+test/tmp/
+test/tmp.path.*/
+/sample_data/*
+.history/
+*.pth
+*.png
+*.avif
+*.jpeg
+*.jpg
+!docs/images/*.jpg
+*.xml
+*.iml
+*.json
+!.claude/settings.json
+*.onnx
+!mcomix/upscale_models/*.onnx
+.venv-winml/
+*.pdf
+tools/bench_out/*
+# Code review output
+/review/
+
+# Random-model ONNX numerical reference arrays
+/tools/weights/*.reference.npz
+*.npz

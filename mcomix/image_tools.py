@@ -1,12 +1,16 @@
 """image_tools.py - Various image manipulations."""
 
+import itertools
 import operator
+from dataclasses import dataclass
 from gi.repository import GLib, GdkPixbuf, Gdk, Gtk
 import PIL
 from PIL import Image
 from PIL import ImageEnhance
 from PIL import ImageOps
-from io import StringIO
+from PIL import features
+from io import BytesIO
+from typing import Optional, Sequence, Tuple, Union
 
 from mcomix.preferences import prefs
 from mcomix import constants
@@ -16,13 +20,20 @@ from mcomix.i18n import _
 
 PIL_VERSION = ('Pillow', PIL.__version__)
 
+
+def _avif_supported() -> bool:
+    try:
+        return features.check_module('avif')
+    except ValueError:
+        # Pillow before 11.2 has no AVIF module.
+        return False
+
+
 # Unfortunately gdk_pixbuf_version is not exported, so show the GTK+ version instead.
 log.info(f'GDK version: {GdkPixbuf.PIXBUF_VERSION}, GTK+: {Gtk.get_major_version()}.{Gtk.get_minor_version()}, GLib: {GLib.MAJOR_VERSION}.{GLib.MINOR_VERSION}')
-log.info('PIL version: %s [%s]', PIL_VERSION[0], PIL_VERSION[1])
+log.info('PIL version: %s [%s], AVIF: %s', PIL_VERSION[0], PIL_VERSION[1], _avif_supported())
 
 # Fallback pixbuf for missing images.
-MISSING_IMAGE_ICON = None
-
 _missing_icon_dialog = Gtk.Dialog()
 _missing_icon_pixbuf = _missing_icon_dialog.render_icon(
         Gtk.STOCK_MISSING_IMAGE, Gtk.IconSize.LARGE_TOOLBAR)
@@ -78,16 +89,33 @@ def get_fitting_size(source_size, target_size,
                 width = int(max(src_width * height / src_height, 1))
     return (width, height)
 
+
+#: 'scaling quality' value for Lanczos resampling with Pillow, only used to
+#: draw pages. It is GdkPixbuf's HYPER value, which GdkPixbuf deprecated
+#: (lower quality than BILINEAR), so former "Hyperbolic" settings become Lanczos.
+SCALING_LANCZOS = int(GdkPixbuf.InterpType.HYPER)
+_LANCZOS = getattr(Image, 'Resampling', Image).LANCZOS
+
+
+def gdk_scaling_quality(quality: Optional[int] = None) -> int:
+    """ Returns the GdkPixbuf interpolation for scaling <quality> (default:
+    the preference). Lanczos is only used for pages; elsewhere bilinear. """
+    if quality is None:
+        quality = prefs['scaling quality']
+    return int(GdkPixbuf.InterpType.BILINEAR) if quality == SCALING_LANCZOS else quality
+
+
 def fit_pixbuf_to_rectangle(src, rect, rotation):
+    """ Resizes page <src> for display, with the scaling quality preference. """
     return fit_in_rectangle(src, rect[0], rect[1],
                             rotation=rotation,
                             keep_ratio=False,
-                            scale_up=True)
+                            scale_up=True,
+                            scaling_quality=prefs['scaling quality'])
 
 def fit_in_rectangle(src, width, height, keep_ratio=True, scale_up=False, rotation=0, scaling_quality=None):
     """Scale (and return) a pixbuf so that it fits in a rectangle with
-    dimensions <width> x <height>. A negative <width> or <height>
-    means an unbounded dimension - both cannot be negative.
+    dimensions <width> x <height>.
 
     If <rotation> is 90, 180 or 270 we rotate <src> first so that the
     rotated pixbuf is fitted in the rectangle.
@@ -99,13 +127,11 @@ def fit_in_rectangle(src, width, height, keep_ratio=True, scale_up=False, rotati
     dimensions may be smaller than the target dimensions.
 
     If <src> has an alpha channel it gets a checkboard background.
+
+    <scaling_quality> is a GdkPixbuf interpolation or SCALING_LANCZOS
+    (opaque images only; others use bilinear). It defaults to the
+    preference, with bilinear instead of Lanczos.
     """
-    # "Unbounded" really means "bounded to RENDER_SIZE_LIMIT" - for simplicity.
-    # MComix would probably choke on larger images anyway.
-    if width < 0:
-        width = constants.RENDER_SIZE_LIMIT
-    elif height < 0:
-        height = constants.RENDER_SIZE_LIMIT
     width = max(width, 1)
     height = max(height, 1)
 
@@ -113,7 +139,7 @@ def fit_in_rectangle(src, width, height, keep_ratio=True, scale_up=False, rotati
         width, height = height, width
 
     if scaling_quality is None:
-        scaling_quality = prefs['scaling quality']
+        scaling_quality = gdk_scaling_quality()
 
     src_width = src.get_width()
     src_height = src.get_height()
@@ -130,14 +156,29 @@ def fit_in_rectangle(src, width, height, keep_ratio=True, scale_up=False, rotati
             # Using anything other than nearest interpolation will result in a
             # modified image if no resizing takes place (even if it's opaque).
             scaling_quality = GdkPixbuf.InterpType.NEAREST
-        src = src.composite_color_simple(width, height, scaling_quality,
+        src = src.composite_color_simple(width, height, gdk_scaling_quality(scaling_quality),
                                          255, *composite_color_args)
     elif width != src_width or height != src_height:
-        src = src.scale_simple(width, height, scaling_quality)
+        if scaling_quality == SCALING_LANCZOS:
+            src = pil_to_pixbuf(pixbuf_to_pil(src).resize((width, height), _LANCZOS))
+        else:
+            src = src.scale_simple(width, height, scaling_quality)
 
     src = rotate_pixbuf(src, rotation)
 
     return src
+
+
+def fit_pil_to_rectangle(im: Image.Image, rect: Sequence[int],
+                         rotation: int) -> GdkPixbuf.Pixbuf:
+    """ Same as fit_pixbuf_to_rectangle(), for an opaque PIL image,
+    resized with LANCZOS. """
+    width, height = max(int(rect[0]), 1), max(int(rect[1]), 1)
+    if tools.rotation_swaps_axes(rotation):
+        width, height = height, width
+    if im.size != (width, height):
+        im = im.resize((width, height), _LANCZOS)
+    return rotate_pixbuf(pil_to_pixbuf(im), rotation)
 
 
 def add_border(pixbuf, thickness, colour=0x000000FF):
@@ -153,115 +194,45 @@ def add_border(pixbuf, thickness, colour=0x000000FF):
     return canvas
 
 
-def get_most_common_edge_colour(pixbufs, edge=2):
-    """Return the most commonly occurring pixel value along the four edges
-    of <pixbuf>. The return value is a sequence, (r, g, b), with 16 bit
-    values. If <pixbuf> is a tuple, the edges will be computed from
-    both the left and the right image.
+def get_most_common_edge_colour(pixbufs):
+    """Return the most commonly occurring pixel value along the left and
+    right edges of the static pixbuf <pixbufs>. The return value is a
+    sequence, (r, g, b), with 16 bit values. If <pixbufs> is a tuple, the
+    left edge is taken from the first image and the right edge from the
+    second.
 
     Note: This could be done more cleanly with subpixbuf(), but that
     doesn't work as expected together with get_pixels().
     """
 
-    def group_colors(colors, steps=10):
-        """ This rounds a list of colors in C{colors} to the next nearest value,
-        i.e. 128, 83, 10 becomes 130, 85, 10 with C{steps}=5. This compensates for
-        dirty colors where no clear dominating color can be made out.
+    def group_colors(colors):
+        """ Rounds the (count, color) pairs in C{colors} to steps of 10,
+        i.e. 128, 83, 10 becomes 130, 80, 10. This compensates for dirty colors
+        where no clear dominating color can be made out.
 
-        @return: The color that appears most often in the prominent group."""
+        @return: The color that appears most often in the prominent group, the
+        first run of colors with the same rounding that has the largest count."""
+        groups = [list(group) for _, group in itertools.groupby(colors,
+            key=lambda pair: tuple(min(255, (v + 5) // 10 * 10) for v in pair[1]))]
+        prominent = max(groups, key=lambda group: sum(count for count, _ in group))
+        return max(prominent, key=operator.itemgetter(0))[1]
 
-        # Start group
-        group = (0, 0, 0)
-        # List of (count, color) pairs, group contains most colors
-        colors_in_prominent_group = []
-        color_count_in_prominent_group = 0
-        # List of (count, color) pairs, current color group
-        colors_in_group = []
-        color_count_in_group = 0
-
-        for count, color in colors:
-
-            # Round color
-            rounded = [0] * len(color)
-            for i, color_value in enumerate(color):
-                if steps % 2 == 0:
-                    middle = steps // 2
-                else:
-                    middle = steps // 2 + 1
-
-                remainder = color_value % steps
-                if remainder >= middle:
-                    color_value = color_value + (steps - remainder)
-                else:
-                    color_value = color_value - remainder
-
-                rounded[i] = min(255, max(0, color_value))
-
-            # Change prominent group if necessary
-            if rounded == group:
-                # Color still fits in the previous color group
-                colors_in_group.append((count, color))
-                color_count_in_group += count
-            else:
-                # Color group changed, check if current group has more colors
-                # than last group
-                if color_count_in_group > color_count_in_prominent_group:
-                    colors_in_prominent_group = colors_in_group
-                    color_count_in_prominent_group = color_count_in_group
-
-                group = rounded
-                colors_in_group = [ (count, color) ]
-                color_count_in_group = count
-
-        # Cleanup if only one edge color group was found
-        if color_count_in_group > color_count_in_prominent_group:
-            colors_in_prominent_group = colors_in_group
-
-        colors_in_prominent_group.sort(key=operator.itemgetter(0), reverse=True)
-        # List is now sorted by color count, first color appears most often
-        return colors_in_prominent_group[0][1]
-
-    def get_edge_pixbuf(pixbuf, side, edge):
-        """ Returns a pixbuf corresponding to the side passed in <side>.
-        Valid sides are 'left', 'right', 'top', 'bottom'. """
-        pixbuf = static_image(pixbuf)
+    def get_edge_pixbuf(pixbuf, left):
         width = pixbuf.get_width()
         height = pixbuf.get_height()
-        edge = min(edge, width, height)
-
+        edge = min(2, width, height)
         subpix = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
                 pixbuf.get_has_alpha(), 8, edge, height)
-        if side == 'left':
-            pixbuf.copy_area(0, 0, edge, height, subpix, 0, 0)
-        elif side == 'right':
-            pixbuf.copy_area(width - edge, 0, edge, height, subpix, 0, 0)
-        elif side == 'top':
-            pixbuf.copy_area(0, 0, width, edge, subpix, 0, 0)
-        elif side == 'bottom':
-            pixbuf.copy_area(0, height - edge, width, edge, subpix, 0, 0)
-        else:
-            assert False, 'Invalid edge side'
-
+        pixbuf.copy_area(0 if left else width - edge, 0, edge, height, subpix, 0, 0)
         return subpix
 
-    if not pixbufs:
-        return (0, 0, 0)
-
     if not isinstance(pixbufs, (tuple, list)):
-        left_edge = get_edge_pixbuf(pixbufs, 'left', edge)
-        right_edge = get_edge_pixbuf(pixbufs, 'right', edge)
-    else:
-        assert len(pixbufs) == 2, 'Expected two pages in list'
-        left_edge = get_edge_pixbuf(pixbufs[0], 'left', edge)
-        right_edge = get_edge_pixbuf(pixbufs[1], 'right', edge)
-
-    # Find all edge colors. Color count is separate for all four edges
+        pixbufs = (pixbufs, pixbufs)
     ungrouped_colors = []
-    for edge in (left_edge, right_edge):
-        im = pixbuf_to_pil(edge)
+    for pixbuf, left in zip(pixbufs, (True, False)):
+        im = pixbuf_to_pil(get_edge_pixbuf(pixbuf, left))
         ungrouped_colors.extend(im.getcolors(im.size[0] * im.size[1]))
 
-    # Sum up colors from all edges
     ungrouped_colors.sort(key=operator.itemgetter(1))
     most_used = group_colors(ungrouped_colors)[:3]
     return [color * 257 for color in most_used]
@@ -285,7 +256,6 @@ def pil_to_pixbuf(im, keep_orientation=False):
     )
     if keep_orientation:
         # Keep orientation metadata.
-        orientation = None
         exif = im.getexif()
         orientation = exif.get(274, None)
         if orientation is None:
@@ -313,47 +283,94 @@ def static_image(pixbuf):
         return pixbuf.get_static_image()
     return pixbuf
 
-def unwrap_image(image):
-    """ Returns an object that contains the image data based on
-    Gtk.Image.get_storage_type or None if image is None or image.get_storage_type
-    returns Gtk.ImageType.EMPTY. """
-    if image is None:
-        return None
-    t = image.get_storage_type()
-    if t == Gtk.ImageType.EMPTY:
-        return None
-    if t == Gtk.ImageType.PIXBUF:
-        return image.get_pixbuf()
-    if t == Gtk.ImageType.ANIMATION:
-        return image.get_animation()
-    if t == Gtk.ImageType.PIXMAP:
-        return image.get_pixmap()
-    if t == Gtk.ImageType.IMAGE:
-        return image.get_image()
-    if t == Gtk.ImageType.STOCK:
-        return image.get_stock()
-    if t == Gtk.ImageType.ICON_SET:
-        return image.get_icon_set()
-    raise ValueError()
-
 def set_from_pixbuf(image, pixbuf):
     if is_animation(pixbuf):
         return image.set_from_animation(pixbuf)
     else:
         return image.set_from_pixbuf(pixbuf)
 
-def load_pixbuf(path):
-    """ Loads a pixbuf from a given image file. """
+#: An image file path, or the contents of an image file.
+ImageSource = Union[str, bytes]
+
+
+@dataclass(frozen=True)
+class WebPAnimation:
+    source: ImageSource
+    frames: int
+    loops: int
+    duration: float
+
+def _describe_source(source: ImageSource) -> str:
+    """ Returns a description of <source> for log messages. """
+    if isinstance(source, bytes):
+        return '%u bytes' % len(source)
+    return source
+
+def _open_pil(source: ImageSource) -> Image.Image:
+    """ Opens <source> with PIL. """
+    if isinstance(source, bytes):
+        return Image.open(BytesIO(source))
+    return Image.open(source)
+
+def _gdk_loader(data: bytes,
+                size: Optional[Tuple[int, int]] = None) -> GdkPixbuf.PixbufLoader:
+    """ Feeds <data> to a new PixbufLoader and returns it once closed.
+    If <size> is given, the image is decoded to fit in it (keeping the
+    aspect ratio), which lets some loaders (e.g. JPEG) decode faster. """
+    loader = GdkPixbuf.PixbufLoader()
+    if size is not None:
+        def size_prepared(loader, src_width, src_height):
+            # Same rounding as GdkPixbuf.Pixbuf.new_from_file_at_size.
+            width, height = size
+            if height * src_width > width * src_height:
+                height = int(0.5 + width * src_height / src_width)
+            else:
+                width = int(0.5 + height * src_width / src_height)
+            loader.set_size(max(width, 1), max(height, 1))
+        loader.connect('size-prepared', size_prepared)
+    loader.write(data)
+    loader.close()
+    return loader
+
+def _gdk_load_animation(source: ImageSource) -> GdkPixbuf.PixbufAnimation:
+    if isinstance(source, bytes):
+        animation = _gdk_loader(source).get_animation()
+        if animation is None:
+            raise GLib.Error('no animation in image data')
+        return animation
+    return GdkPixbuf.PixbufAnimation.new_from_file(source)
+
+def _gdk_load(source: ImageSource) -> GdkPixbuf.Pixbuf:
+    if isinstance(source, bytes):
+        pixbuf = _gdk_loader(source).get_pixbuf()
+        if pixbuf is None:
+            raise GLib.Error('no image in image data')
+        return pixbuf
+    return GdkPixbuf.Pixbuf.new_from_file(source)
+
+def _gdk_load_at_size(source: ImageSource, width: int, height: int) -> GdkPixbuf.Pixbuf:
+    if isinstance(source, bytes):
+        pixbuf = _gdk_loader(source, size=(width, height)).get_pixbuf()
+        if pixbuf is None:
+            raise GLib.Error('no image in image data')
+        return pixbuf
+    return GdkPixbuf.Pixbuf.new_from_file_at_size(source, width, height)
+
+def load_pixbuf(source: ImageSource):
+    """ Loads a pixbuf from a given image file path, or from
+    the contents of an image file. """
     pixbuf = None
     last_error = None
-    providers = get_image_info(path)[2]
+    image_format, dimensions, providers = get_image_info(source)
+    if image_format == 'WEBP':
+        providers = (constants.IMAGEIO_PIL, constants.IMAGEIO_GDKPIXBUF)
     for provider in providers:
         try:
             # TODO use dynamic dispatch instead of "if" chain
             if provider == constants.IMAGEIO_GDKPIXBUF:
                 if prefs['animation mode'] != constants.ANIMATION_DISABLED:
                     try:
-                        pixbuf = GdkPixbuf.PixbufAnimation.new_from_file(path)
+                        pixbuf = _gdk_load_animation(source)
                         if pixbuf.is_static_image():
                             pixbuf = pixbuf.get_static_image()
                     except GLib.GError:
@@ -362,12 +379,14 @@ def load_pixbuf(path):
                         # Gdk.pixbuf_new_from_file, so we need to continue.
                         pass
                 if pixbuf is None:
-                    pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+                    pixbuf = _gdk_load(source)
             elif provider == constants.IMAGEIO_PIL:
-                # TODO When using PIL, whether or how animations work is
-                # currently undefined.
-                im = Image.open(path)
-                pixbuf = pil_to_pixbuf(im, keep_orientation=True)
+                with _open_pil(source) as im:
+                    pixbuf = pil_to_pixbuf(im, keep_orientation=True)
+                    if im.format == 'WEBP' and getattr(im, 'is_animated', False):
+                        pixbuf.webp_animation = WebPAnimation(
+                            source, getattr(im, 'n_frames'), im.info.get('loop', 0),
+                            max(1, im.info.get('duration', 100)) / 1000)
             else:
                 raise TypeError()
         except Exception as e:
@@ -375,21 +394,21 @@ def load_pixbuf(path):
             last_error = e
         if pixbuf is not None:
             # stop loop on success
-            log.debug("provider %s succeeded in loading %s", provider, path)
+            log.debug("provider %s succeeded in loading %s", provider, _describe_source(source))
             break
-        log.debug("provider %s failed to load %s", provider, path)
+        log.debug("provider %s failed to load %s", provider, _describe_source(source))
     if pixbuf is None:
         # raising necessary because caller expects pixbuf to be not None
         raise last_error or TypeError()
     return pixbuf
 
-def load_pixbuf_size(path, width, height):
-    """ Loads a pixbuf from a given image file and scale it to fit
-    inside (width, height). """
+def load_pixbuf_size(source: ImageSource, width: int, height: int):
+    """ Loads a pixbuf from a given image file path, or from the
+    contents of an image file, and scale it to fit inside (width, height). """
     # TODO similar to load_pixbuf, should be merged using callbacks etc.
     pixbuf = None
     last_error = None
-    image_format, image_dimensions, providers = get_image_info(path)
+    image_format, image_dimensions, providers = get_image_info(source)
     for provider in providers:
         try:
             # TODO use dynamic dispatch instead of "if" chain
@@ -397,19 +416,19 @@ def load_pixbuf_size(path, width, height):
                 # If we could not get the image info, still try to load
                 # the image to let GdkPixbuf raise the appropriate exception.
                 if (0, 0) == image_dimensions:
-                    pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+                    pixbuf = _gdk_load(source)
                 # Work around GdkPixbuf bug: https://bugzilla.gnome.org/show_bug.cgi?id=735422
                 # (currently https://gitlab.gnome.org/GNOME/gdk-pixbuf/issues/45)
                 elif 'GIF' == image_format:
-                    pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+                    pixbuf = _gdk_load(source)
                 else:
                     # Don't upscale if smaller than target dimensions!
                     image_width, image_height = image_dimensions
                     if image_width <= width and image_height <= height:
                         width, height = image_width, image_height
-                    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(path, width, height)
+                    pixbuf = _gdk_load_at_size(source, width, height)
             elif provider == constants.IMAGEIO_PIL:
-                im = Image.open(path)
+                im = _open_pil(source)
                 im.draft(None, (width, height))
                 pixbuf = pil_to_pixbuf(im, keep_orientation=True)
             else:
@@ -419,43 +438,16 @@ def load_pixbuf_size(path, width, height):
             last_error = e
         if pixbuf is not None:
             # stop loop on success
-            log.debug("provider %s succeeded in loading %s at size %s", provider, path, (width, height))
+            log.debug("provider %s succeeded in loading %s at size %s",
+                      provider, _describe_source(source), (width, height))
             break
-        log.debug("provider %s failed to load %s at size %s", provider, path, (width, height))
+        log.debug("provider %s failed to load %s at size %s",
+                  provider, _describe_source(source), (width, height))
     if pixbuf is None:
         # raising necessary because caller expects pixbuf to be not None
         raise last_error or TypeError()
-    return fit_in_rectangle(pixbuf, width, height, GdkPixbuf.InterpType.BILINEAR)
-
-def load_pixbuf_data(imgdata):
-    """ Loads a pixbuf from the data passed in <imgdata>. """
-    # TODO similar to load_pixbuf, should be merged using callbacks etc.
-    pixbuf = None
-    last_error = None
-    for provider in (constants.IMAGEIO_GDKPIXBUF, constants.IMAGEIO_PIL):
-        try:
-            # TODO use dynamic dispatch instead of "if" chain
-            if provider == constants.IMAGEIO_GDKPIXBUF:
-                loader = GdkPixbuf.PixbufLoader()
-                loader.write(imgdata)
-                loader.close()
-                pixbuf = loader.get_pixbuf()
-            elif provider == constants.IMAGEIO_PIL:
-                pixbuf = pil_to_pixbuf(Image.open(StringIO(imgdata)), keep_orientation=True)
-            else:
-                raise TypeError()
-        except Exception as e:
-            # current provider could not load image
-            last_error = e
-        if pixbuf is not None:
-            # stop loop on success
-            log.debug("provider %s succeeded in decoding %s bytes", provider, len(imgdata))
-            break
-        log.debug("provider %s failed to decode %s bytes", provider, len(imgdata))
-    if pixbuf is None:
-        # raising necessary because caller expects pixbuf to be not None
-        raise last_error
-    return pixbuf
+    return fit_in_rectangle(pixbuf, width, height,
+                            scaling_quality=GdkPixbuf.InterpType.BILINEAR)
 
 def enhance(pixbuf, brightness=1.0, contrast=1.0, saturation=1.0,
   sharpness=1.0, autocontrast=False, invert_color=False):
@@ -497,18 +489,18 @@ def _get_png_implied_rotation(pixbuf_or_image):
     if len(exif_lines) < 4 or 'exif' != exif_lines[1]:
         # Not valid Exif data.
         return None
-    size = int(exif_lines[2])
     try:
+        size = int(exif_lines[2])
         data = bytes.fromhex(''.join(exif_lines[3:]))
-    except ValueError:
-        # Not valid hexadecimal content.
+        if size != len(data):
+            return None
+        exif = Image.Exif()
+        exif.load(data)
+        orientation = exif.get(274, None) # Orientation tag
+    except Exception:
+        # Pillow raises assorted errors (struct.error, SyntaxError, ...) on
+        # malformed Exif; the page must still draw unrotated.
         return None
-    if size != len(data):
-        # Sizes should match.
-        return None
-    exif = Image.Exif()
-    exif.load(data)
-    orientation = exif.get(274, None) # Orientation tag
     if orientation is not None:
         orientation = str(orientation)
     return orientation
@@ -617,11 +609,50 @@ def color_to_floats_rgba(color, alpha=1.0):
 def get_composite_color_args(variant):
     return ((8, 0x777777, 0x999999), (1024, 0xFFFFFF, 0xFFFFFF))[variant]
 
+_GDK_FORMATS = None
+
+def _get_gdk_formats():
+    """ Returns the set of (upper case) format names GdkPixbuf can load. """
+    global _GDK_FORMATS
+    if _GDK_FORMATS is None:
+        _GDK_FORMATS = {fmt.get_name().upper()
+                        for fmt in GdkPixbuf.Pixbuf.get_formats()}
+    return _GDK_FORMATS
+
+def _get_image_info_from_data(data):
+    """ Same as get_image_info(), for the contents of an image file. """
+    try:
+        # Only the header is read.
+        im = _open_pil(data)
+        # Multi-picture JPEGs (e.g. from cameras) are still JPEGs.
+        image_format = 'JPEG' if 'MPO' == im.format else im.format
+        image_dimensions = im.size
+    except Exception:
+        im = None
+    if im is not None:
+        if image_format in _get_gdk_formats():
+            providers = (constants.IMAGEIO_GDKPIXBUF, constants.IMAGEIO_PIL)
+        else:
+            providers = (constants.IMAGEIO_PIL, constants.IMAGEIO_GDKPIXBUF)
+        return (image_format, image_dimensions, providers)
+    try:
+        # Unknown to PIL: decode with GdkPixbuf.
+        loader = _gdk_loader(data)
+        pixbuf = loader.get_pixbuf()
+        return (loader.get_format().get_name().upper(),
+                (pixbuf.get_width(), pixbuf.get_height()),
+                (constants.IMAGEIO_GDKPIXBUF, constants.IMAGEIO_PIL))
+    except Exception:
+        return (_('Unknown filetype'), (0, 0), ())
+
 def get_image_info(path):
     """Return information about and select preferred providers for loading
-    the image specified by C{path}. The result is a tuple
+    the image specified by C{path}, an image file path or the contents
+    of an image file. The result is a tuple
     C{(format, (width, height), providers)}.
     """
+    if isinstance(path, bytes):
+        return _get_image_info_from_data(path)
     image_format = None
     image_dimensions = None
     providers = ()
@@ -642,9 +673,9 @@ def get_image_info(path):
             image_format = im.format
             image_dimensions = im.size
             providers = (constants.IMAGEIO_PIL, constants.IMAGEIO_GDKPIXBUF)
-        except IOError:
-            # If the file cannot be found, or the image
-            # cannot be opened and identified.
+        except Exception:
+            # Unreadable, unidentified, or over Pillow's decompression bomb
+            # limit, as in _get_image_info_from_data.
             pass
     if image_format is None:
         image_format = _('Unknown filetype')

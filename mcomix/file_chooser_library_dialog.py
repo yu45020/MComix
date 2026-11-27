@@ -23,22 +23,13 @@ class _LibraryFileChooserDialog(file_chooser_base_dialog._BaseFileChooserDialog)
         self.add_archive_filters()
 
         # Remove 'All files' filter from base class
+        self.filechooser.remove_filter(self.filechooser.list_filters()[0])
+        # files_chosen saves an index into this list, without "All files".
         filters = self.filechooser.list_filters()
-        self.filechooser.remove_filter(filters[0])
-        self.filechooser.set_filter(filters[1])
-
-        try:
-            # When setting this to the first filter ("All files"), this
-            # fails on some GTK+ versions and sets the filter to "blank".
-            # The effect is the same though (i.e. display all files), and
-            # there is no solution that I know of, so we'll have to live
-            # with it. It only happens the second time a dialog is created
-            # though, which is very strange.
-            self.filechooser.set_filter(filters[
-                prefs['last filter in library filechooser']])
-
-        except Exception:
-            self.filechooser.set_filter(filters[0])
+        index = prefs['last filter in library filechooser']
+        if not isinstance(index, int) or not 0 <= index < len(filters):
+            index = 0
+        self.filechooser.set_filter(filters[index])
 
         # Remove default buttons and add buttons that make more sense
         for widget in self.get_action_area().get_children():
@@ -62,7 +53,7 @@ class _LibraryFileChooserDialog(file_chooser_base_dialog._BaseFileChooserDialog)
                 pass
 
             close_library_filechooser_dialog()
-            self._library.add_books(paths, None)
+            self._library.add_books(paths)
 
         else:
             close_library_filechooser_dialog()

@@ -1,6 +1,5 @@
 """ Gtk.IconView subclass for dynamically generated thumbnails. """
 
-import queue
 from gi.repository import Gtk, GLib
 
 from mcomix.preferences import prefs
@@ -27,30 +26,41 @@ class ThumbnailViewBase(object):
 
         #: Ignore updates when this flag is True.
         self._updates_stopped = True
+        self._update_generation = 0
+        self._thumbnail_rows = {}
+        self.connect('notify::model', self._model_changed)
+        self.connect('destroy', self._destroy_view)
         #: Worker thread
         self._thread = WorkerThread(self._pixbuf_worker,
                                     name='thumbview',
                                     unique_orders=True,
                                     max_threads=prefs["max threads"])
 
-    def generate_thumbnail(self, uid):
-        """ This function must return the thumbnail for C{uid}. """
-        raise NotImplementedError()
-
-    def get_visible_range(self):
-        """ See L{Gtk.IconView.get_visible_range}. """
-        raise NotImplementedError()
-
     def stop_update(self):
         """ Stops generation of pixbufs. """
         self._updates_stopped = True
+        self._update_generation += 1
         self._thread.stop()
+        self._thumbnail_rows.clear()
+
+    def _model_changed(self, widget: Gtk.Widget, parameter: object) -> None:
+        """Fence jobs from a detached model without waiting for decoding."""
+        self._updates_stopped = True
+        self._update_generation += 1
+        self._thread.clear_orders()
+        self._thumbnail_rows.clear()
+
+    def _destroy_view(self, widget: Gtk.Widget) -> None:
+        self.stop_update()
 
     def draw_thumbnails_on_screen(self, *args):
         """ Prepares valid thumbnails for currently displayed icons.
         This method is supposed to be called from the expose-event
         callback function. """
 
+        model = self.get_model()
+        if model is None:
+            return
         visible = self.get_visible_range()
         if not visible:
             # No valid paths available
@@ -64,12 +74,12 @@ class ThumbnailViewBase(object):
         additional = (end - start) // 2
         required = list(range(start, end + additional + 1)) + \
                    list(range(max(0, start - additional), start))
-        model = self.get_model()
         # Filter invalid paths.
         required = [path for path in required if 0 <= path < len(model)]
         with self._thread:
             # Flush current pixmap generation orders.
             self._thread.clear_orders()
+            queued = set()
             for path in required:
                 iter = model.get_iter(path)
                 uid, generated = model.get(iter,
@@ -77,30 +87,62 @@ class ThumbnailViewBase(object):
                                            self._status_column)
                 # Do not queue again if thumbnail was already created.
                 if not generated:
-                    pixbufs_needed.append((uid, iter))
+                    pixbufs_needed.append(self._thumbnail_order(model, iter, uid))
+                    queued.add(uid)
+            # Discarded orders never finish: keep row references for this
+            # window only. A dropped running order still updates its row.
+            self._thumbnail_rows = {uid: entry for uid, entry
+                                    in self._thumbnail_rows.items() if uid in queued}
             if len(pixbufs_needed) > 0:
                 self._updates_stopped = False
                 self._thread.extend_orders(pixbufs_needed)
 
+    def _thumbnail_order(self, model: Gtk.TreeModel, iterator: Gtk.TreeIter,
+                         uid: object) -> tuple:
+        """Reuse a pending row's identity, but never one from a removed row."""
+        path = model.get_path(iterator)
+        previous = self._thumbnail_rows.get(uid)
+        if previous is None or previous[0].get_path() != path:
+            previous = (Gtk.TreeRowReference.new(model, path), object())
+            self._thumbnail_rows[uid] = previous
+        row, token = previous
+        return ((self._update_generation, uid, token), model, row)
+
     def _pixbuf_worker(self, order):
         """ Run by a worker thread to generate the thumbnail for a path."""
-        uid, iter = order
-        pixbuf = self.generate_thumbnail(uid)
-        if pixbuf is not None:
-            GLib.idle_add(self._pixbuf_finished, iter, pixbuf)
+        (generation, uid, token), model, row = order
+        pixbuf = None
+        try:
+            pixbuf = self.generate_thumbnail(uid)
+        finally:
+            # Also release the row's bookkeeping when generation fails.
+            GLib.idle_add(self._pixbuf_finished, generation, uid,
+                          model, row, pixbuf, token)
 
-    def _pixbuf_finished(self, iter, pixbuf):
-        """ Executed when a pixbuf was created, to actually insert the pixbuf
-        into the view store. C{pixbuf_info} is a tuple containing
-        (index, pixbuf). """
-
+    def _pixbuf_finished(self, generation: int, uid: object,
+                         model: Gtk.TreeModel, row: Gtk.TreeRowReference,
+                         pixbuf: object, token: object) -> int:
+        """Resolve the queued row only on the GTK thread, if it still exists."""
+        pending = self._thumbnail_rows.get(uid)
+        if pending is not None and pending[1] is token:
+            del self._thumbnail_rows[uid]
         if self._updates_stopped:
             return 0
+        if generation != self._update_generation or model != self.get_model():
+            return 0
 
-        model = self.get_model()
-        model.set(iter, self._status_column, True, self._pixbuf_column, pixbuf)
-
-        # Remove this idle handler.
+        path = row.get_path()
+        if path is None:
+            # A replacement needs its own request, even if it reused this UID.
+            self.queue_draw()
+            return 0
+        iterator = model.get_iter(path)
+        if model.get_value(iterator, self._uid_column) != uid:
+            self.queue_draw()
+            return 0
+        if pixbuf is not None:
+            model.set(iterator, self._status_column, True,
+                      self._pixbuf_column, pixbuf)
         return 0
 
 class ThumbnailIconView(Gtk.IconView, ThumbnailViewBase):
@@ -113,9 +155,6 @@ class ThumbnailIconView(Gtk.IconView, ThumbnailViewBase):
         # Connect events
         self.connect('draw', self.draw_thumbnails_on_screen)
 
-    def get_visible_range(self):
-        return Gtk.IconView.get_visible_range(self)
-
 class ThumbnailTreeView(Gtk.TreeView, ThumbnailViewBase):
     def __init__(self, model, uid_column, pixbuf_column, status_column):
         assert 0 != (model.get_flags() & Gtk.TreeModelFlags.ITERS_PERSIST)
@@ -124,8 +163,5 @@ class ThumbnailTreeView(Gtk.TreeView, ThumbnailViewBase):
 
         # Connect events
         self.connect('draw', self.draw_thumbnails_on_screen)
-
-    def get_visible_range(self):
-        return Gtk.TreeView.get_visible_range(self)
 
 # vim: expandtab:sw=4:ts=4

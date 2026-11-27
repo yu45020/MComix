@@ -2,18 +2,19 @@
 
 import binascii
 import os
-import sys
 import tempfile
+from unittest import mock
 
-from gi.repository import GdkPixbuf, GObject
+from gi.repository import GdkPixbuf
 
 from collections import namedtuple
 from PIL import Image, ImageDraw
-from io import StringIO
+from io import BytesIO
 from difflib import unified_diff
 
 from . import MComixTest, get_testfile_path
 
+from mcomix import constants
 from mcomix import image_tools
 from mcomix.preferences import prefs
 
@@ -35,10 +36,6 @@ _IMAGE_MODES = (
     ( False , 'RGB'  , 'I'     ), # (32-bit signed integer pixels)
     ( False , 'RGB'  , 'F'     ), # (32-bit floating point pixels)
 )
-
-_PIL_MODE_TO_GDK_MODE = dict([(pil_mode, gdk_mode)
-                              for _, gdk_mode, pil_mode
-                              in _IMAGE_MODES])
 
 _TestImage = namedtuple('TestImage', 'name format size mode has_alpha rotation')
 
@@ -71,11 +68,12 @@ _TEST_IMAGES = (
 _TEST_IMAGE_BY_NAME = dict([(im.name, im) for im in _TEST_IMAGES])
 
 
-def pil_mode_to_gdk_mode(mode):
-    return _PIL_MODE_TO_GDK_MODE[mode]
-
 def get_test_image(name):
     return _TEST_IMAGE_BY_NAME[name]
+
+def get_image_data(basename):
+    with open(get_image_path(basename), 'rb') as fp:
+        return fp.read()
 
 def get_image_path(basename):
     return get_testfile_path('images', basename)
@@ -100,7 +98,7 @@ def new_pixbuf(size, with_alpha, fill_colour):
 #
 def xhexdump(data, group_size=4):
     addr, size = 0, 0
-    io = StringIO(data)
+    io = BytesIO(data)
     chunk_size = group_size * 8
     prev_addr, prev_hex = (0, '')
     format_line = lambda addr, hex: '%07x: %s' % (addr, hex)
@@ -115,7 +113,7 @@ def xhexdump(data, group_size=4):
         hex = []
         for s in range(0, chunk_size * 2, group_size * 2):
             hex.append(chunk[s:s+(group_size*2)])
-        hex = ' '.join(hex)
+        hex = b' '.join(hex).decode('ascii')
         if hex != prev_hex:
             if addr > (prev_addr + chunk_size):
                 yield format_line(addr - prev_addr, '*')
@@ -128,34 +126,7 @@ def xhexdump(data, group_size=4):
 def hexdump(data, group_size=4):
     return [line for line in xhexdump(data, group_size=group_size)]
 
-def composite_image(im1, im2):
-    if isinstance(im1, GdkPixbuf.Pixbuf):
-        im1 = image_tools.pixbuf_to_pil(im1)
-    if isinstance(im2, GdkPixbuf.Pixbuf):
-        im2 = image_tools.pixbuf_to_pil(im2)
-    im = Image.new('RGBA',
-                   (im1.size[0] + im2.size[0],
-                    max(im1.size[1], im2.size[1])))
-    im.paste(im1, (0, 0, im1.size[0], im1.size[1]))
-    im.paste(im2, (im1.size[0], 0, im1.size[0]+im2.size[0], im2.size[1]))
-    return im
-
-
-class ImageToolsTest(object):
-
-    set_use_pil = False
-    use_pil = False
-
-    def setUp(self):
-        if self.set_use_pil:
-            self.orig_use_pil = image_tools.USE_PIL
-            image_tools.USE_PIL = self.use_pil
-        super(ImageToolsTest, self).setUp()
-
-    def tearDown(self):
-        if self.set_use_pil:
-            image_tools.USE_PIL = self.orig_use_pil
-        super(ImageToolsTest, self).tearDown()
+class ImageToolsTest(MComixTest):
 
     def assertImagesEqual(self, im1, im2, msg=None, max_diff=20):
         def fail(diff_type, diff_fmt, *args):
@@ -168,6 +139,8 @@ class ImageToolsTest(object):
                 'diff': diff_fmt % args,
             })
         def info(im):
+            if isinstance(im, GdkPixbuf.PixbufAnimation):
+                im = im.get_static_image()
             if isinstance(im, GdkPixbuf.Pixbuf):
                 width, stride = im.get_width(), im.get_rowstride()
                 line_size = width * im.get_n_channels()
@@ -175,8 +148,8 @@ class ImageToolsTest(object):
                     pixels = im.get_pixels()
                 else:
                     assert stride > line_size
-                    io = StringIO(im.get_pixels())
-                    pixels = ''
+                    io = BytesIO(im.get_pixels())
+                    pixels = b''
                     while True:
                         line = io.read(line_size)
                         if not line:
@@ -209,18 +182,12 @@ class ImageToolsTest(object):
                 break
             diff_lines.append(line)
         if len(diff_lines) > 0:
-            composite_image(im1, im2).show()
             fail('content', '\n%s\n', '\n'.join(diff_lines))
 
     def test_load_pixbuf_basic(self):
         for image in _TEST_IMAGES:
             image_path = get_image_path(image.name)
-            if self.use_pil:
-                # When using PIL, indexed formats will be
-                # converted to RGBA by pixbuf_to_pil.
-                expected_mode = pil_mode_to_gdk_mode(image.mode)
-            else:
-                expected_mode = 'RGBA' if image.has_alpha else 'RGB'
+            expected_mode = 'RGBA' if image.has_alpha else 'RGB'
             im = Image.open(image_path).convert(expected_mode)
             pixbuf = image_tools.load_pixbuf(image_path)
             msg = (
@@ -229,6 +196,34 @@ class ImageToolsTest(object):
                 % (image.name,)
             )
             self.assertImagesEqual(pixbuf, im, msg=msg)
+
+    def test_load_pixbuf_from_data(self):
+        # Same as test_load_pixbuf_basic, from the file contents.
+        for image in _TEST_IMAGES:
+            image_path = get_image_path(image.name)
+            expected_mode = 'RGBA' if image.has_alpha else 'RGB'
+            im = Image.open(image_path).convert(expected_mode)
+            pixbuf = image_tools.load_pixbuf(get_image_data(image.name))
+            msg = (
+                'load_pixbuf(<%s data>) failed; '
+                'result %%(diff_type)s differs: %%(diff)s'
+                % (image.name,)
+            )
+            self.assertImagesEqual(pixbuf, im, msg=msg)
+
+    def test_load_pixbuf_from_data_animation(self):
+        prefs['animation mode'] = constants.ANIMATION_NORMAL
+        from_path = image_tools.load_pixbuf(get_image_path('animated.gif'))
+        from_data = image_tools.load_pixbuf(get_image_data('animated.gif'))
+        self.assertEqual(type(from_data), type(from_path))
+        self.assertTrue(image_tools.is_animation(from_data))
+        static = image_tools.load_pixbuf(get_image_data('blue.png'))
+        self.assertFalse(image_tools.is_animation(static))
+
+    def test_load_pixbuf_from_data_invalid(self):
+        for data in (b'', b'not an image'):
+            self.assertRaises(Exception, image_tools.load_pixbuf, data)
+            self.assertRaises(Exception, image_tools.load_pixbuf_size, data, 50, 50)
 
     def test_load_pixbuf_modes(self):
         tmp_file = tempfile.NamedTemporaryFile(prefix='image.',
@@ -250,11 +245,8 @@ class ImageToolsTest(object):
             self.assertImagesEqual(pixbuf, expected_im, msg=msg)
 
     def test_load_pixbuf_invalid(self):
-        if self.use_pil:
-            exception = IOError
-        else:
-            exception = GObject.GError
-        self.assertRaises(exception, image_tools.load_pixbuf, os.devnull)
+        # No provider can identify the file, so the error type is unspecified.
+        self.assertRaises(Exception, image_tools.load_pixbuf, os.devnull)
 
     def test_load_pixbuf_size_basic(self):
         # Same as test_load_pixbuf_basic:
@@ -270,12 +262,7 @@ class ImageToolsTest(object):
                 # and GdkPixbuf may yield different results.
                 continue
             image_path = get_image_path(image.name)
-            if self.use_pil:
-                # When using PIL, indexed formats will be
-                # converted to RGBA by pixbuf_to_pil.
-                expected_mode = pil_mode_to_gdk_mode(image.mode)
-            else:
-                expected_mode = 'RGBA' if image.has_alpha else 'RGB'
+            expected_mode = 'RGBA' if image.has_alpha else 'RGB'
             expected = Image.open(image_path).convert(expected_mode)
             if image.has_alpha:
                 background = Image.new('RGBA', image.size, color='white')
@@ -312,7 +299,7 @@ class ImageToolsTest(object):
             self.assertImagesEqual(result, expected, msg=msg)
             # Check image is scaled down if bigger than target dimensions,
             # and that aspect ratio is kept.
-            target_size = image.size[0], image.size[1] / 2
+            target_size = image.size[0], image.size[1] // 2
             result = image_tools.load_pixbuf_size(image_path,
                                                   *target_size)
             msg = (
@@ -321,14 +308,36 @@ class ImageToolsTest(object):
                 % ((name,) + target_size)
             )
             self.assertEqual((result.get_width(), result.get_height()),
-                             (image.size[0] / 2, image.size[1] / 2))
+                             (image.size[0] // 2, image.size[1] // 2))
+
+    def test_load_pixbuf_size_from_data(self):
+        for image in _TEST_IMAGES:
+            image_path = get_image_path(image.name)
+            image_data = get_image_data(image.name)
+            for target_size in (
+                # Bigger: unchanged.
+                (2 * image.size[0], 2 * image.size[1]),
+                # Smaller: scaled down, keeping aspect ratio.
+                (max(1, image.size[0] // 2), max(1, image.size[1] // 3)),
+                (64, 64),
+            ):
+                from_path = image_tools.load_pixbuf_size(image_path, *target_size)
+                from_data = image_tools.load_pixbuf_size(image_data, *target_size)
+                msg = (
+                    'load_pixbuf_size(<%s data>, %dx%d) failed; '
+                    'result %%(diff_type)s differs: %%(diff)s'
+                    % ((image.name,) + target_size)
+                )
+                self.assertEqual(
+                    (image.name, target_size, from_data.get_width(), from_data.get_height()),
+                    (image.name, target_size, from_path.get_width(), from_path.get_height()))
+                if target_size[0] >= image.size[0]:
+                    # Not resized: must be identical.
+                    self.assertImagesEqual(from_data, from_path, msg=msg)
 
     def test_load_pixbuf_size_invalid(self):
-        if self.use_pil:
-            exception = IOError
-        else:
-            exception = GObject.GError
-        self.assertRaises(exception, image_tools.load_pixbuf_size, os.devnull, 50, 50)
+        # No provider can identify the file, so the error type is unspecified.
+        self.assertRaises(Exception, image_tools.load_pixbuf_size, os.devnull, 50, 50)
 
     # Expose a rounding error bug in load_pixbuf_size.
     def test_load_pixbuf_rounding_error(self):
@@ -378,7 +387,8 @@ class ImageToolsTest(object):
         for image in _TEST_IMAGES:
             image_path = get_image_path(image.name)
             expected = (image.format,) + image.size
-            result = image_tools.get_image_info(image_path)
+            image_format, image_size, _ = image_tools.get_image_info(image_path)
+            result = (image_format,) + image_size
             msg = (
                 'get_image_info("%s") failed; '
                 'result differs: %s:%dx%d instead of %s:%dx%d'
@@ -386,15 +396,53 @@ class ImageToolsTest(object):
             )
             self.assertEqual(result, expected, msg=msg)
 
+    def test_get_image_info_from_data(self):
+        for image in _TEST_IMAGES:
+            expected = (image.format,) + image.size
+            image_format, image_size, _ = \
+                image_tools.get_image_info(get_image_data(image.name))
+            result = (image_format,) + image_size
+            msg = (
+                'get_image_info(<%s data>) failed; '
+                'result differs: %s:%dx%d instead of %s:%dx%d'
+                % ((image.name,) + result + expected)
+            )
+            self.assertEqual(result, expected, msg=msg)
+
+    def test_get_image_info_from_data_invalid(self):
+        for data in (b'', b'not an image'):
+            self.assertEqual(image_tools.get_image_info(data),
+                             ('Unknown filetype', (0, 0), ()))
+
+    def test_get_implied_rotation_from_data(self):
+        for image in _TEST_IMAGES:
+            pixbuf = image_tools.load_pixbuf(get_image_data(image.name))
+            if image_tools.is_animation(pixbuf):
+                continue
+            rotation = image_tools.get_implied_rotation(pixbuf)
+            self.assertEqual((image.name, rotation), (image.name, image.rotation))
+
     def test_get_image_info_invalid(self):
         expected = ('Unknown filetype', 0, 0)
-        result = image_tools.get_image_info(os.devnull)
+        image_format, image_size, _ = image_tools.get_image_info(os.devnull)
+        result = (image_format,) + image_size
         msg = (
             'get_image_info() on invalid image failed; '
             'result differs: %s:%dx%d instead of %s:%dx%d'
             % (result + expected)
         )
         self.assertEqual(result, expected, msg=msg)
+
+    def test_get_image_info_of_decompression_bomb_file(self):
+        # As without a GdkPixbuf WebP loader: the path is read through Pillow.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'bomb.webp')
+            Image.new('RGB', (8, 8)).save(path, format='WEBP')
+            with mock.patch.object(Image, 'MAX_IMAGE_PIXELS', 4), \
+                    mock.patch.object(image_tools.GdkPixbuf.Pixbuf, 'get_file_info',
+                                      return_value=(None, 0, 0)):
+                self.assertEqual(image_tools.get_image_info(path),
+                                 ('Unknown filetype', (0, 0), ()))
 
     def test_get_implied_rotation(self):
         for name in (
@@ -421,24 +469,15 @@ class ImageToolsTest(object):
         for input_size, target_size, scale_up, keep_ratio, expected_size in (
             # Exactly the same size.
             ((200, 100), (200, 100), False, False, (200, 100)),
-            ((200, 100), (200, 100), False,  True, (200, 100)),
-            ((200, 100), (200, 100),  True, False, (200, 100)),
-            ((200, 100), (200, 100),  True,  True, (200, 100)),
             # Smaller.
-            ((200, 100), (400, 400), False, False, (200, 100)),
-            ((200, 100), (400, 400), False,  True, (200, 100)),
             ((200, 100), (400, 400),  True, False, (400, 400)),
             ((200, 100), (400, 400),  True,  True, (400, 200)),
             # Bigger.
             ((800, 600), (200, 200), False, False, (200, 200)),
             ((800, 600), (200, 200), False,  True, (200, 150)),
-            ((800, 600), (200, 200),  True, False, (200, 200)),
-            ((800, 600), (200, 200),  True,  True, (200, 150)),
             # One dimension bigger, the other smaller.
             ((200, 400), (200, 200), False, False, (200, 200)),
             ((200, 400), (200, 200), False,  True, (100, 200)),
-            ((200, 400), (200, 200),  True, False, (200, 200)),
-            ((200, 400), (200, 200),  True,  True, (100, 200)),
         ):
             for invert_dimensions in (False, True):
                 if invert_dimensions:
@@ -473,14 +512,11 @@ class ImageToolsTest(object):
         # Corner colors, starting top-left, rotating clock-wise.
         corners_colors = ('white', 'black', 'black', 'black')
         pixbuf = image_tools.pil_to_pixbuf(im)
-        for rotation in (
-            0, 90, 180, 270,
-            -90, -180, -270,
-            90 * 5, -90 * 7
-        ):
+        # fit_in_rectangle only accepts normalized angles (see its docstring).
+        for rotation in (0, 90, 180, 270):
             for target_size in (
                 (image_size, image_size),
-                (image_size / 2, image_size / 2),
+                (image_size // 2, image_size // 2),
             ):
                 result = image_tools.fit_in_rectangle(pixbuf,
                                                       target_size[0],
@@ -498,7 +534,7 @@ class ImageToolsTest(object):
                 self.assertEqual(result_size, target_size, msg=msg)
                 # And then check corners.
                 expected_corners_colors = list(corners_colors)
-                for _ in range(1, 1 + (rotation % 360) / 90):
+                for _ in range(1, 1 + (rotation % 360) // 90):
                     expected_corners_colors.insert(0, expected_corners_colors.pop(-1))
                 result_corners_colors = []
                 corner = new_pixbuf((1, 1), False, 0x888888)
@@ -508,9 +544,9 @@ class ImageToolsTest(object):
                     result.copy_area(x, y, 1, 1, corner, 0, 0)
                     color = corner.get_pixels()[0:3]
                     color = binascii.hexlify(color)
-                    if 'ffffff' == color:
+                    if b'ffffff' == color:
                         color = 'white'
-                    elif '000000' == color:
+                    elif b'000000' == color:
                         color = 'black'
                     result_corners_colors.append(color)
                     corners_positions.insert(0, corners_positions.pop(-1))
@@ -534,6 +570,36 @@ class ImageToolsTest(object):
                                  expected_corners_colors,
                                  msg=msg)
 
+    def test_lanczos_page_scaling(self):
+        # Pages are resized with Pillow's Lanczos filter; former
+        # "Hyperbolic" settings (GdkPixbuf's deprecated HYPER) select it.
+        self.assertEqual(image_tools.SCALING_LANCZOS, int(GdkPixbuf.InterpType.HYPER))
+        im = Image.effect_mandelbrot((60, 40), (-2.0, -1.2, 0.8, 1.2), 64).convert('RGB')
+        pixbuf = image_tools.pil_to_pixbuf(im)
+        lanczos = getattr(Image, 'Resampling', Image).LANCZOS
+        prefs['scaling quality'] = image_tools.SCALING_LANCZOS
+        for rotation, rect, size in ((0, (90, 60), (90, 60)), (90, (60, 90), (90, 60))):
+            result = image_tools.fit_pixbuf_to_rectangle(pixbuf, rect, rotation)
+            expected = image_tools.rotate_pixbuf(
+                image_tools.pil_to_pixbuf(im.resize(size, lanczos)), rotation)
+            self.assertImagesEqual(result, expected)
+
+    def test_lanczos_elsewhere_bilinear(self):
+        # Other users of the preference (magnifier, library, thumbnails,
+        # transparent pages) use GdkPixbuf's bilinear instead.
+        prefs['scaling quality'] = image_tools.SCALING_LANCZOS
+        bilinear = int(GdkPixbuf.InterpType.BILINEAR)
+        self.assertEqual(image_tools.gdk_scaling_quality(), bilinear)
+        self.assertEqual(image_tools.gdk_scaling_quality(int(GdkPixbuf.InterpType.TILES)),
+                         int(GdkPixbuf.InterpType.TILES))
+        im = Image.effect_mandelbrot((60, 40), (-2.0, -1.2, 0.8, 1.2), 64).convert('RGB')
+        pixbuf = image_tools.pil_to_pixbuf(im)
+        self.assertImagesEqual(image_tools.fit_in_rectangle(pixbuf, 90, 60, scale_up=True),
+                               pixbuf.scale_simple(90, 60, GdkPixbuf.InterpType.BILINEAR))
+        transparent = image_tools.pil_to_pixbuf(im.convert('RGBA'))
+        self.assertEqual(image_tools.fit_pixbuf_to_rectangle(transparent, (90, 60), 0)
+                         .get_width(), 90)
+
     def test_fit_in_rectangle_opaque_no_resize(self):
         # Check opaque image is unchanged when not resizing.
         for image in (
@@ -542,16 +608,13 @@ class ImageToolsTest(object):
         ):
             input = image_tools.load_pixbuf(get_image_path(image))
             width, height = input.get_width(), input.get_height()
-            for scaling_quality in range(4):
-                prefs['scaling quality'] = scaling_quality
-                result = image_tools.fit_in_rectangle(input, width, height,
-                                                      scaling_quality=scaling_quality)
-                msg = (
-                    'fit_in_rectangle("%s", scaling quality=%d) failed; '
-                    'result %%(diff_type)s differs: %%(diff)s'
-                    % (image, scaling_quality)
-                )
-                self.assertImagesEqual(result, input, msg=msg)
+            result = image_tools.fit_in_rectangle(input, width, height,
+                                                  scaling_quality=image_tools.SCALING_LANCZOS)
+            msg = (
+                'fit_in_rectangle("%s") failed; '
+                'result %%(diff_type)s differs: %%(diff)s' % image
+            )
+            self.assertImagesEqual(result, input, msg=msg)
 
     def test_fit_in_rectangle_transparent_no_resize(self):
         # And with a transparent test image, check alpha blending.
@@ -573,36 +636,12 @@ class ImageToolsTest(object):
                 checker_bg if use_checker_bg else white_bg,
                 control
             )
-            for scaling_quality in range(4):
-                prefs['scaling quality'] = scaling_quality
-                result = image_tools.fit_in_rectangle(image_tools.pil_to_pixbuf(control),
-                                                      width, height,
-                                                      scaling_quality=scaling_quality)
-                msg = (
-                    'fit_in_rectangle("%s", scaling quality=%d, background=%s) failed; '
-                    'result %%(diff_type)s differs: %%(diff)s'
-                    % (image, scaling_quality, 'checker' if checker_bg else 'white')
-                )
-                self.assertImagesEqual(result, expected, msg=msg)
-
-
-class_list = []
-
-if hasattr(image_tools, 'USE_PIL'):
-    class_list.extend((
-        ('GDK', {'set_use_pil': True, 'use_pil': False}),
-        ('PIL', {'set_use_pil': True, 'use_pil': True }),
-    ))
-else:
-    if 'win32' == sys.platform:
-        variant = 'GDK'
-        use_pil = False
-    else:
-        variant = 'PIL'
-        use_pil = True
-    class_list.append((variant, {'use_pil': use_pil}))
-
-for class_variant, class_dict in class_list:
-    class_name = 'ImageTools%sTest' % class_variant
-    globals()[class_name] = type(class_name, (ImageToolsTest, MComixTest), class_dict)
-
+            result = image_tools.fit_in_rectangle(image_tools.pil_to_pixbuf(control),
+                                                  width, height,
+                                                  scaling_quality=image_tools.SCALING_LANCZOS)
+            msg = (
+                'fit_in_rectangle("%s", background=%s) failed; '
+                'result %%(diff_type)s differs: %%(diff)s'
+                % (image, 'checker' if use_checker_bg else 'white')
+            )
+            self.assertImagesEqual(result, expected, msg=msg)

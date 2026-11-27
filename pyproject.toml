@@ -1,21 +1,22 @@
 [project]
 name = "mcomix"
 dynamic = ["version"]
-description = "GTK comic book viewer"
+description = "GTK comic book and manga viewer with GPU neural upscaling (a hard fork of MComix)"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.7"
 license = {file = "COPYING"}
 authors = [{name = "Pontus Ekberg"}]
-maintainers = [{name = "The MComix Team"}]
-keywords = ["comix", "comics", "manga", "images", "reader", "image viewer", "cbr", "cbz"]
+maintainers = [{name = "yu45020"}]
+keywords = ["comix", "comics", "manga", "images", "reader", "image viewer", "cbr", "cbz",
+            "webp", "avif", "upscaling", "super-resolution"]
 classifiers = [
-  "Development Status :: 6 - Mature",
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Win32 (MS Windows)",
   "Environment :: X11 Applications :: GTK",
   "Intended Audience :: End Users/Desktop",
-  "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+  "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
   "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
-  "Operating System :: POSIX :: BSD",
   "Programming Language :: Python :: 3",
   "Topic :: Multimedia :: Graphics :: Viewers"
 ]
@@ -29,6 +30,14 @@ dependencies = [
 fileformats = [
   "chardet",
   "PyMuPDF>=1.19.2"
+]
+# Neural upscaling of small pages
+upscale = [
+  "numpy",
+  # Includes DirectML; windowsml adds faster Windows ML providers (e.g.
+  # TensorRT-RTX). Pinned: both packages are young.
+  "onnxruntime-windowsml==1.30.0.202609102321; os_name == 'nt'",
+  "windowsml==2.4.89; os_name == 'nt'"
 ]
 dev = [
   # For running tests
@@ -50,10 +59,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://mcomix.sourceforge.io"
-Documentation = "https://sourceforge.net/projects/mcomix/Wiki/Home/"
-Repository = "https://sourceforge.net/p/mcomix/git/ci/master/tree/"
-Changelog = "https://sourceforge.net/p/mcomix/news/"
+Homepage = "https://github.com/yu45020/mcomix"
+Documentation = "https://github.com/yu45020/mcomix/tree/main/docs/user"
+Repository = "https://github.com/yu45020/mcomix"
+Issues = "https://github.com/yu45020/mcomix/issues"
+Upstream = "https://sourceforge.net/projects/mcomix/"
 
 [project.scripts]
 mcomix = "mcomix.__main__:main"

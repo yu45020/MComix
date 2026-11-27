@@ -3,3 +3,4 @@ recursive-include mcomix/messages *.mo
 graft mcomix/images
 graft share
 prune test
+graft mcomix/upscale_models

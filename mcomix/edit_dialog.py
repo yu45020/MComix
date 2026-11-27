@@ -2,10 +2,10 @@
 
 import os
 import tempfile
+import shutil
+import stat
 from gi.repository import Gdk, GLib, Gtk
-import re
 
-from mcomix.preferences import prefs
 from mcomix import archive_packer
 from mcomix import file_chooser_simple_dialog
 from mcomix import image_tools
@@ -13,6 +13,7 @@ from mcomix import edit_image_area
 from mcomix import edit_comment_area
 from mcomix import constants
 from mcomix import message_dialog
+from mcomix import log
 from mcomix.i18n import _
 
 _dialog = None
@@ -28,12 +29,12 @@ class _EditArchiveDialog(Gtk.Dialog):
         super(_EditArchiveDialog, self).__init__(_('Edit archive'), window, Gtk.DialogFlags.MODAL,
             (Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL))
 
-        self._accept_changes_button = self.add_button(Gtk.STOCK_APPLY, Gtk.ResponseType.APPLY)
+        self.add_button(Gtk.STOCK_APPLY, Gtk.ResponseType.APPLY)
 
         self.kill = False # Dialog is killed.
         self.file_handler = window.filehandler
         self._window = window
-        self._imported_files = []
+        self._retained_directories = []
 
         self._save_button = self.add_button(Gtk.STOCK_SAVE_AS, constants.RESPONSE_SAVE_AS)
 
@@ -46,6 +47,7 @@ class _EditArchiveDialog(Gtk.Dialog):
             min(Gdk.Screen.get_default().get_height() - 50, 600))
 
         self.connect('response', self._response)
+        self.connect('destroy', self._cleanup_retained_inputs)
 
         self._image_area = edit_image_area._ImageArea(self, window)
         self._comment_area = edit_comment_area._CommentArea(self)
@@ -64,6 +66,8 @@ class _EditArchiveDialog(Gtk.Dialog):
         """Load the original files from the archive or directory into
         the edit dialog.
         """
+        if self.kill:
+            return False
         self._save_button.set_sensitive(False)
         self._import_button.set_sensitive(False)
         self._window.set_cursor(Gdk.Cursor.new(Gdk.CursorType.WATCH))
@@ -79,63 +83,90 @@ class _EditArchiveDialog(Gtk.Dialog):
 
         return False
 
-    def _pack_archive(self, archive_path):
-        """Create a new archive with the chosen files."""
+    def _pack_archive(self, archive_path: str) -> None:
+        """Pack completely before releasing inputs, then replace atomically."""
+        if self.kill:
+            return
         self.set_sensitive(False)
         self._window.set_cursor(Gdk.Cursor.new(Gdk.CursorType.WATCH))
-
-        while Gtk.events_pending():
-            Gtk.main_iteration_do(False)
-
-        image_files = self._image_area.get_file_listing()
-        comment_files = self._comment_area.get_file_listing()
-
+        temporary = None
+        source = None
+        released = False
+        saved = False
+        page = self._window.imagehandler.get_current_page() or 1
         try:
-            fd, tmp_path = tempfile.mkstemp(
-                suffix='.%s' % os.path.basename(archive_path),
-                prefix='tmp.', dir=os.path.dirname(archive_path))
-            # Close open tempfile handle (writing is handled by the packer)
+            handler = self.file_handler
+            source = handler.get_path_to_base() if handler.archive_type is not None else None
+            replacing_current = (source is not None and os.path.exists(source) and os.path.exists(archive_path) and os.path.samefile(source, archive_path))
+            image_files = self._image_area.get_file_listing()
+            comment_files = self._comment_area.get_file_listing()
+            if handler.materialize(image_files + comment_files):
+                raise OSError(_('Could not extract the selected files.'))
+            fd, temporary = tempfile.mkstemp(
+                suffix='.%s' % os.path.basename(archive_path), prefix='tmp.',
+                dir=os.path.dirname(os.path.abspath(archive_path)))
             os.close(fd)
-            fail = False
-
-        except:
-            fail = True
-
-        if not fail:
-            packer = archive_packer.Packer(image_files, comment_files, tmp_path,
+            packer = archive_packer.Packer(image_files, comment_files, temporary,
                 os.path.splitext(os.path.basename(archive_path))[0])
             packer.pack()
-            packing_success = packer.wait()
-
-            if packing_success:
-                # Preserve permissions if currently edited files come from an archive
-                if (self._window.filehandler.archive_type is not None and
-                    os.path.exists(self._window.filehandler.get_path_to_base())):
-                    mode = os.stat(self._window.filehandler.get_path_to_base()).st_mode
-                else:
-                    mode = os.stat(tmp_path).st_mode
-
-                # Remove existing file (Win32 fails on rename otherwise)
-                if os.path.exists(archive_path):
-                    os.unlink(archive_path)
-
-                os.rename(tmp_path, archive_path)
-                os.chmod(archive_path, mode)
-
-                _close_dialog()
-            else:
-                fail = True
-        
-        self._window.set_cursor(None)
-        if fail:
+            if not packer.wait():
+                raise OSError(_('Could not pack the selected files.'))
+            # Set permissions before replacement so any failure preserves the
+            # old target. Never unlink a target before its replacement exists.
+            if source is not None and os.path.exists(source):
+                os.chmod(temporary, os.stat(source).st_mode)
+            if replacing_current:
+                directory = handler.close_file(keep_temporary=True)
+                released = True
+                if directory is not None:
+                    if self.kill:
+                        _EditArchiveDialog._delete_retained_directory(self, directory)
+                    else:
+                        self._retained_directories.append(directory)
+                if self.kill or handler._shutting_down:
+                    raise RuntimeError(_('The current book is closing.'))
+            handler.wait_for_file_release(archive_path)
+            os.replace(temporary, archive_path)
+            temporary = None
+            saved = True
+        except Exception as error:
+            log.error(_('! Could not save archive: %s'), error)
+        finally:
+            if temporary is not None:
+                try:
+                    try:
+                        os.unlink(temporary)
+                    except PermissionError:
+                        # A read-only source may have made our temporary file
+                        # read-only too. It is ours, so make cleanup possible.
+                        os.chmod(temporary, os.stat(temporary).st_mode | stat.S_IWUSR)
+                        os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    log.error(_('! Could not remove temporary archive: %s'), error)
+            if not self.kill:
+                self._window.set_cursor(None)
+                self.set_sensitive(True)
+        if self.kill:
+            return
+        if released and not self.file_handler._shutting_down:
+            # Failed replacement leaves the old archive intact. The dialog
+            # retains its extracted inputs even when reopening uses new storage.
+            try:
+                self.file_handler.open_file(archive_path if saved else source,
+                                            start_page=page)
+            except Exception as error:
+                log.error(_('! Could not reopen archive: %s'), error)
+        if saved:
+            _close_dialog()
+        else:
             dialog = message_dialog.MessageDialog(self._window, 0, Gtk.MessageType.ERROR,
                 Gtk.ButtonsType.CLOSE)
             dialog.set_text(
-                _("The new archive could not be saved!"),
-                _("The original files have not been removed."))
+                _('The new archive could not be saved!'),
+                _('The original files have not been removed.'))
             dialog.run()
-
-            self.set_sensitive(True)
 
     def _response(self, dialog, response):
 
@@ -168,61 +199,51 @@ class _EditArchiveDialog(Gtk.Dialog):
             paths = dialog.get_paths()
             dialog.destroy()
 
-            exts = '|'.join(prefs['comment extensions'])
-            comment_re = re.compile(r'\.(%s)\s*$' % exts, re.I)
+            comment_re = self._window.filehandler.get_comment_regex()
 
             for path in paths:
 
                 if image_tools.is_image_file(path):
-                    self._imported_files.append( path )
                     self._image_area.add_extra_image(path)
 
                 elif os.path.isfile(path):
 
                     if comment_re.search( path ):
-                        self._imported_files.append( path )
                         self._comment_area.add_extra_file(path)
 
         elif response == Gtk.ResponseType.APPLY:
 
-            old_image_array = self._window.imagehandler._image_files
+            new_image_array = self._image_area.get_file_listing()
 
-            treeiter = self._image_area._liststore.get_iter_first()
-
-            new_image_array = []
-
-            while treeiter is not None:
-                path = self._image_area._liststore.get_value(treeiter, 2)
-                new_image_array.append(path)
-                treeiter = self._image_area._liststore.iter_next(treeiter)
-
-            new_positions = []
-
-            end_index = len(old_image_array) - 1
-
-            for image_path in old_image_array:
-
-                try:
-                    new_position = new_image_array.index( image_path )
-                    new_positions.append(new_position)
-                except ValueError:
-                    # the path was not found in the new array so that means it was deleted
-                    new_positions.append(end_index)
-                    end_index -= 1
-
-            self._window.imagehandler._image_files = new_image_array
-            self._window.imagehandler._raw_pixbufs = {}
-            self._window.imagehandler.do_cacheing()
+            self._window.imagehandler.reset_page_list(new_image_array)
             self._window.thumbnailsidebar.clear()
-            self._window.set_page(1)
+            if new_image_array:
+                self._window.set_page(1)
+            else:
+                self._window.clear()
             self._window.thumbnailsidebar.load_thumbnails()
 
         else:
             _close_dialog()
             self.kill = True
 
-    def destroy(self):
+    def _delete_retained_directory(self, directory: str) -> None:
+        try:
+            self.file_handler.thread_delete(directory)
+        except Exception as error:
+            log.error(_('! Could not start temporary directory cleanup: %s'), error)
+            # If a worker cannot start, do not abandon this owner's storage.
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def _cleanup_retained_inputs(self, widget: Gtk.Widget) -> None:
+        self.kill = True
         self._image_area.cleanup()
+        for directory in self._retained_directories:
+            self._delete_retained_directory(directory)
+        self._retained_directories.clear()
+
+    def destroy(self):
+        self._cleanup_retained_inputs(self)
         Gtk.Dialog.destroy(self)
 
 def open_dialog(action, window):

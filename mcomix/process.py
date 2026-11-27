@@ -3,25 +3,13 @@
 import sys
 import os
 import subprocess
-
-from mcomix import i18n
+import errno
+from typing import Callable, Iterable, Optional
 
 
 NULL = open(os.devnull, 'r+b')
 PIPE = subprocess.PIPE
 STDOUT = subprocess.STDOUT
-
-# Convert argument vector to system's file encoding where necessary
-# to prevent automatic conversion when appending Unicode strings
-# to byte strings later on.
-def _fix_args(args):
-    fixed_args = []
-    for arg in args:
-        if isinstance(arg, str):
-            fixed_args.append(arg.encode(sys.getfilesystemencoding()))
-        else:
-            fixed_args.append(arg)
-    return fixed_args
 
 def _get_creationflags():
     if 'win32' == sys.platform:
@@ -32,27 +20,57 @@ def _get_creationflags():
 
 # Cannot spawn processes with PythonW/Win32 unless stdin
 # and stderr are redirected to a pipe/devnull as well.
-def call(args, stdin=NULL, stdout=NULL, stderr=NULL):
-    return 0 == subprocess.call(_fix_args(args), stdin=stdin,
-                                stdout=stdout, stderr=stderr,
-                                creationflags=_get_creationflags())
-
-
 def popen(args, stdin=NULL, stdout=PIPE, stderr=NULL):
-    return subprocess.Popen(_fix_args(args), stdin=stdin,
+    return subprocess.Popen(args, stdin=stdin,
                             stdout=stdout, stderr=stderr,
                             creationflags=_get_creationflags())
 
 
-if 'win32' == sys.platform:
-    _exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+def _is_absolute_search_dir(path: str) -> bool:
+    """Require PATH directories to be independent of the working directory."""
+    if 'win32' == sys.platform and not os.path.splitdrive(path)[0]:
+        return False
+    return os.path.isabs(path)
 
-def find_executable(candidates, workdir=None, is_valid_candidate=None):
+
+def _get_application_dir() -> Optional[str]:
+    """Locate bundled helpers without trusting the invocation's argv[0]."""
+    if getattr(sys, 'frozen', False):
+        if not _is_absolute_search_dir(sys.executable):
+            return None
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+if 'win32' == sys.platform:
+    _exe_dir = _get_application_dir()
+
+#: Used when PATHEXT is unset; the formats CreateProcessW can start.
+_DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD'
+
+
+def _windows_executable_name(name: str) -> str:
+    """Keep a PATHEXT extension (e.g. .bat, .com); otherwise append .exe."""
+    pathext = os.environ.get('PATHEXT') or _DEFAULT_PATHEXT
+    extensions = {ext.lower() for ext in pathext.split(os.pathsep) if ext}
+    extensions.add('.exe')
+    if os.path.splitext(name)[1].lower() in extensions:
+        return name
+    return name + '.exe'
+
+
+def find_executable(
+        candidates: Iterable[str], workdir: Optional[str] = None,
+        is_valid_candidate: Optional[Callable[[str], bool]] = None
+) -> Optional[str]:
     """ Find executable in path.
 
     Return an absolute path to a valid executable or None.
 
-    <workdir> default to the current working directory if not set.
+    <workdir> defaults to the current working directory. It is used only
+    to resolve candidates containing a directory component (e.g. ./tool).
+    Bare names search only absolute PATH directories, never the working
+    directory implicitly. Empty and relative PATH entries are ignored.
 
     <is_valid_candidate> is an optional function that must return True
     if the path passed in argument is a valid candidate (to check for
@@ -63,12 +81,11 @@ def find_executable(candidates, workdir=None, is_valid_candidate=None):
 
     On Windows:
 
-    - '.exe' will be appended to each candidate if not already
+    - '.exe' will be appended to each candidate unless it already ends
+      with an extension listed in PATHEXT (e.g. '.bat', '.cmd', '.com')
 
     - MComix executable directory is prepended to the path on Windows
       (to support embedded tools/executables in the distribution).
-
-    - <workdir> will be inserted first in the path.
 
     On Unix:
 
@@ -79,10 +96,9 @@ def find_executable(candidates, workdir=None, is_valid_candidate=None):
         workdir = os.getcwd()
     workdir = os.path.abspath(workdir)
 
-    search_path = os.environ['PATH'].split(os.pathsep)
-    if 'win32' == sys.platform:
-        if workdir is not None:
-            search_path.insert(0, workdir)
+    search_path = [path for path in os.environ.get('PATH', '').split(os.pathsep)
+                   if _is_absolute_search_dir(path)]
+    if 'win32' == sys.platform and _exe_dir is not None:
         search_path.insert(0, _exe_dir)
 
     is_valid_exe = lambda exe: \
@@ -97,21 +113,23 @@ def find_executable(candidates, workdir=None, is_valid_candidate=None):
                 is_valid_candidate(exe)
 
     for name in candidates:
+        if not name:
+            continue
 
-        # On Windows, must end with '.exe'
+        # On Windows, must end with '.exe' or another PATHEXT extension.
         if 'win32' == sys.platform:
-            if not name.endswith('.exe'):
-                name = name + '.exe'
+            name = _windows_executable_name(name)
 
         # Absolute path?
         if os.path.isabs(name):
+            name = os.path.abspath(name)
             if is_valid(name):
                 return name
 
         # Does candidate have a directory component?
         elif os.path.dirname(name):
             # Yes, check relative to working directory.
-            path = os.path.normpath(os.path.join(workdir, name))
+            path = os.path.abspath(os.path.join(workdir, name))
             if is_valid(path):
                 return path
 
@@ -125,76 +143,24 @@ def find_executable(candidates, workdir=None, is_valid_candidate=None):
     return None
 
 
-def Win32Popen(cmd):
-    """ Spawns a new process on Win32. cmd is a list of parameters. 
-    This method's sole purpose is calling CreateProcessW, not
-    CreateProcessA as it is done by subprocess.Popen. """
-    import ctypes
+def Win32Popen(cmd) -> int:
+    """ Spawns a new process on Win32 and returns its PID. cmd is a list
+    of parameters. """
+    # Without an explicit executable, Windows searches the working
+    # directory itself, undoing find_executable's lookup restrictions.
+    exe = None
+    if os.path.dirname(cmd[0]):
+        # Explicit commands may name another Windows executable format
+        # (e.g. .com). Preserve the supplied file before trying .exe lookup.
+        explicit = os.path.abspath(cmd[0])
+        if os.path.isfile(explicit) and os.access(explicit, os.R_OK | os.X_OK):
+            exe = explicit
+    if exe is None:
+        exe = find_executable((cmd[0],))
+    if exe is None:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), cmd[0])
 
-    # Declare common data types
-    DWORD = ctypes.c_uint
-    WORD = ctypes.c_ushort
-    LPTSTR = ctypes.c_wchar_p
-    LPBYTE = ctypes.POINTER(ctypes.c_ubyte)
-    HANDLE = ctypes.c_void_p
-
-    class StartupInfo(ctypes.Structure):
-        _fields_ = [("cb", DWORD),
-            ("lpReserved", LPTSTR),
-            ("lpDesktop", LPTSTR),
-            ("lpTitle", LPTSTR),
-            ("dwX", DWORD),
-            ("dwY", DWORD),
-            ("dwXSize", DWORD),
-            ("dwYSize", DWORD),
-            ("dwXCountChars", DWORD),
-            ("dwYCountChars", DWORD),
-            ("dwFillAttribute", DWORD),
-            ("dwFlags", DWORD),
-            ("wShowWindow", WORD),
-            ("cbReserved2", WORD),
-            ("lpReserved2", LPBYTE),
-            ("hStdInput", HANDLE),
-            ("hStdOutput", HANDLE),
-            ("hStdError", HANDLE)]
-    class ProcessInformation(ctypes.Structure):
-        _fields_ = [("hProcess", HANDLE),
-            ("hThread", HANDLE),
-            ("dwProcessId", DWORD),
-            ("dwThreadId", DWORD)]
-
-    LPSTRARTUPINFO = ctypes.POINTER(StartupInfo)
-    LPROCESS_INFORMATION = ctypes.POINTER(ProcessInformation)
-    ctypes.windll.kernel32.CreateProcessW.argtypes = [LPTSTR, LPTSTR,
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool, DWORD,
-        ctypes.c_void_p, LPTSTR, LPSTRARTUPINFO, LPROCESS_INFORMATION]
-    ctypes.windll.kernel32.CreateProcessW.restype = ctypes.c_bool
-
-    # Convert list of arguments into a single string
-    cmdline = subprocess.list2cmdline(cmd)
-    buffer = ctypes.create_unicode_buffer(cmdline)
-
-    # Resolve executable path.
-    exe = find_executable((cmd[0],))
-
-    # Some required structures for the method call...
-    startupinfo = StartupInfo()
-    ctypes.memset(ctypes.addressof(startupinfo), 0, ctypes.sizeof(startupinfo))
-    startupinfo.cb = ctypes.sizeof(startupinfo)
-    processinfo = ProcessInformation()
-
-    # Spawn new process
-    success = ctypes.windll.kernel32.CreateProcessW(exe, buffer,
-            None, None, False, 0, None, None, ctypes.byref(startupinfo),
-            ctypes.byref(processinfo))
-
-    if success:
-        ctypes.windll.kernel32.CloseHandle(processinfo.hProcess)
-        ctypes.windll.kernel32.CloseHandle(processinfo.hThread)
-        return processinfo.dwProcessId
-    else:
-        raise ctypes.WinError(ctypes.GetLastError(),
-                i18n.to_unicode(ctypes.FormatError()))
+    return subprocess.Popen(cmd, executable=exe).pid
 
 
 # vim: expandtab:sw=4:ts=4

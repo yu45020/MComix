@@ -12,7 +12,7 @@ from logging import DEBUG, INFO, WARNING, ERROR
 __all__ = [
     'debug', 'info', 'warning', 'error',
     'DEBUG', 'INFO', 'WARNING', 'ERROR',
-    'getLevel', 'setLevel',
+    'setLevel',
 ]
 
 # Set up default logger.
@@ -24,10 +24,6 @@ if not __logger.handlers:
         '%(asctime)s [%(threadName)s] %(levelname)s: %(message)s',
         '%H:%M:%S'))
     __logger.handlers = [__handler]
-
-
-def getLevel():
-    return __logger.level
 
 
 # The following functions direct all input to __logger.

@@ -43,6 +43,12 @@ class MainUI(Gtk.UIManager):
              None, _('Next page'), _action_lambda(window.flip_page, +1)),
             ('previous_page', Gtk.STOCK_GO_BACK, _('_Previous page'),
              None, _('Previous page'), _action_lambda(window.flip_page, -1)),
+            ('next_page_singlestep', None, _('Shift pairing fo_rward'),
+             None, _('Moves one page forward, changing which pages are shown together.'),
+             _action_lambda(window.flip_page, +1, True)),
+            ('previous_page_singlestep', None, _('Shift pairing bac_k'),
+             None, _('Moves one page back, changing which pages are shown together.'),
+             _action_lambda(window.flip_page, -1, True)),
             ('first_page', Gtk.STOCK_GOTO_FIRST, _('_First page'),
              None, _('First page'), _action_lambda(window.first_page)),
             ('last_page', Gtk.STOCK_GOTO_LAST, _('_Last page'),
@@ -89,7 +95,7 @@ class MainUI(Gtk.UIManager):
                 None, None, window.extract_page),
             ('menu_zoom', 'mcomix-zoom', _('_Zoom')),
             ('menu_recent', Gtk.STOCK_FILE, _('_Recent')),
-            ('menu_bookmarks_popup', 'comix-add-bookmark', _('_Bookmarks')),
+            ('menu_bookmarks_popup', 'mcomix-add-bookmark', _('_Bookmarks')),
             ('menu_bookmarks', None, _('_Bookmarks')),
             ('menu_toolbars', None, _('T_oolbars')),
             ('menu_edit', None, _('_Edit')),
@@ -97,7 +103,7 @@ class MainUI(Gtk.UIManager):
             ('menu_open_with_popup', Gtk.STOCK_OPEN, _('Open _with'), ''),
             ('menu_file', None, _('_File')),
             ('menu_view', None, _('_View')),
-            ('menu_view_popup', 'comix-image', _('_View')),
+            ('menu_view_popup', 'mcomix-image', _('_View')),
             ('menu_go', None, _('_Go')),
             ('menu_go_popup', Gtk.STOCK_GO_FORWARD, _('_Go')),
             ('menu_tools', None, _('_Tools')),
@@ -201,9 +207,6 @@ class MainUI(Gtk.UIManager):
             ('library', 'mcomix-library', _('_Library...'),
                 None, None, library_main_dialog.open_dialog)], window)
 
-        # fix some gtk magic: removing unreqired accelerators
-        Gtk.AccelMap.change_entry('<Actions>/mcomix-main/%s' % 'close', 0, 0, True)
-
         ui_description = """
         <ui>
             <toolbar name="Tool">
@@ -261,6 +264,8 @@ class MainUI(Gtk.UIManager):
                     <menuitem action="fullscreen" />
                     <menuitem action="double_page" />
                     <menuitem action="manga_mode" />
+                    <menuitem action="next_page_singlestep" />
+                    <menuitem action="previous_page_singlestep" />
                     <separator />
                     <menuitem action="best_fit_mode" />
                     <menuitem action="fit_width_mode" />
@@ -354,6 +359,8 @@ class MainUI(Gtk.UIManager):
                     <menuitem action="fullscreen" />
                     <menuitem action="double_page" />
                     <menuitem action="manga_mode" />
+                    <menuitem action="next_page_singlestep" />
+                    <menuitem action="previous_page_singlestep" />
                     <separator />
                     <menuitem action="best_fit_mode" />
                     <menuitem action="fit_width_mode" />
@@ -412,11 +419,11 @@ class MainUI(Gtk.UIManager):
         self.get_widget('/Popup/menu_bookmarks_popup').set_submenu(self.bookmarks_popup)
         self.get_widget('/Popup/menu_bookmarks_popup').show()
 
-        self.recent = recent.RecentFilesMenu(self, window)
+        self.recent = recent.RecentFilesMenu(window)
         self.get_widget('/Menu/menu_file/menu_recent').set_submenu(self.recent)
         self.get_widget('/Menu/menu_file/menu_recent').show()
 
-        self.recentPopup = recent.RecentFilesMenu(self, window)
+        self.recentPopup = recent.RecentFilesMenu(window)
         self.get_widget('/Popup/menu_recent').set_submenu(self.recentPopup)
         self.get_widget('/Popup/menu_recent').show()
 
@@ -433,13 +440,15 @@ class MainUI(Gtk.UIManager):
         self.get_widget('/Tool/expander').set_expand(True)
         self.get_widget('/Tool/expander').set_sensitive(False)
 
+        self._actiongroup.get_action('double_page').connect(
+            'toggled', lambda *_: self.set_sensitivities())
+
     def set_sensitivities(self):
         """Sets the main UI's widget's sensitivities appropriately."""
         general = ('properties',
                    'edit_archive',
                    'extract_page',
                    'save_and_quit',
-                   'close',
                    'delete',
                    'copy_page',
                    'slideshow',
@@ -454,14 +463,23 @@ class MainUI(Gtk.UIManager):
                    'last_page',
                    'go_to',
                    'refresh_archive',
-                   'next_archive',
-                   'previous_archive',
-                   'next_directory',
-                   'previous_directory',
                    'keep_transformation',
                    'enhance_image')
 
+        # Shortcuts obey these sensitivities, and closing or leaving a book
+        # is how a slow load is cancelled.
+        loading = ('close',
+                   'next_archive',
+                   'previous_archive',
+                   'next_directory',
+                   'previous_directory')
+
         comment = ('comments',)
+
+        filehandler = self._window.filehandler
+        for name in loading:
+            self._actiongroup.get_action(name).set_sensitive(
+                filehandler.file_loaded or filehandler.file_loading)
 
         general_sensitive = False
         comment_sensitive = False
@@ -477,6 +495,11 @@ class MainUI(Gtk.UIManager):
 
         for name in comment:
             self._actiongroup.get_action(name).set_sensitive(comment_sensitive)
+
+        pairing_sensitive = (general_sensitive and
+                             self._actiongroup.get_action('double_page').get_active())
+        for name in ('next_page_singlestep', 'previous_page_singlestep'):
+            self._actiongroup.get_action(name).set_sensitive(pairing_sensitive)
 
         self.bookmarks.set_sensitive(general_sensitive)
         self.bookmarks_popup.set_sensitive(general_sensitive)

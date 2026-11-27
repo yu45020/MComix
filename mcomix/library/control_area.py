@@ -11,10 +11,6 @@ from mcomix import labels
 from mcomix.library.watchlist import WatchListDialog
 from mcomix.i18n import _
 
-# The "All books" collection is not a real collection stored in the library,
-# but is represented by this ID in the library's TreeModels.
-_COLLECTION_ALL = -1
-
 
 class _ControlArea(Gtk.Box):
 
@@ -74,7 +70,8 @@ class _ControlArea(Gtk.Box):
         search_entry.connect('activate', self._filter_books)
         search_entry.set_tooltip_text(
             _('Display only those books that have the specified text string '
-              'in their full path. The search is not case sensitive.'))
+              'in their name or full path. The search is not case sensitive. '
+              'Use % to match any number of characters and _ to match one character.'))
         hbox.pack_start(search_entry, True, True, 6)
         label.set_mnemonic_widget(search_entry)
 
@@ -159,9 +156,7 @@ class _ControlArea(Gtk.Box):
             self._dirlabel.set_text('')
 
     def _filter_books(self, entry, *args):
-        """Display only the books in the current collection whose paths
-        contain the string in the Gtk.Entry. The string is not
-        case-sensitive.
+        """Search names and paths with case-insensitive Unicode LIKE patterns.
         """
         self._library.filter_string = entry.get_text()
         if not self._library.filter_string:

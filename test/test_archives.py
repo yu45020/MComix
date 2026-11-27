@@ -1,139 +1,24 @@
 # coding: utf-8
 
+import functools
 import hashlib
-import locale
 import os
 import re
-import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from . import MComixTest, get_testfile_path
 
-from mcomix import process
 from mcomix.archive import (
     archive_recursive,
-    lha_external,
-    pdf_external,
-    rar,
-    rar_external,
     sevenzip_external,
     tar,
     zip,
-    zip_external,
 )
 import mcomix
 
-
-class UnsupportedFormat(Exception):
-
-    def __init__(self, format):
-        super(UnsupportedFormat, self).__init__('unsuported %s format' % format)
-
-class UnsupportedOption(Exception):
-
-    def __init__(self, format, option):
-        super(UnsupportedOption, self).__init__('unsuported option for %s format: %s' % (format, option))
-
-def make_archive(outfile, contents, format='zip', solid=False, password=None, header_encryption=False):
-    if os.path.exists(outfile):
-        raise Exception('%s already exists' % outfile)
-    cleanup = []
-    try:
-        outpath = os.path.abspath(outfile)
-        tmp_dir = tempfile.mkdtemp(dir='test/tmp', prefix='make_archive.')
-        cleanup.append(lambda: shutil.rmtree(tmp_dir))
-        entry_list = []
-        for name, filename in contents:
-            entry_list.append(name)
-            path = os.path.join(tmp_dir, name)
-            if filename is None:
-                os.makedirs(path)
-                continue
-            dir = os.path.dirname(path)
-            if not os.path.exists(dir):
-                os.makedirs(dir)
-            shutil.copy(filename, path)
-        if '7z' == format:
-            cmd = ['7z', 'a']
-            cmd.append('-ms=on' if solid else '-ms=off')
-            if password is not None:
-                cmd.append('-p' + password)
-                if header_encryption:
-                    cmd.append('-mhe=on')
-            else:
-                assert not header_encryption
-            cmd.extend(('--', outpath))
-            # To avoid @ being treated as a special character...
-            tmp_file = tempfile.NamedTemporaryFile(dir='test/tmp',
-                                                   prefix='make_archive.',
-                                                   delete=False)
-            cleanup.append(lambda: os.unlink(tmp_file.name))
-            for entry in entry_list:
-                tmp_file.write(entry.encode(locale.getpreferredencoding()) + '\n')
-            tmp_file.close()
-            entry_list = ['@' + tmp_file.name]
-        elif 'lha' == format:
-            assert password is None
-            assert not header_encryption
-            if solid:
-                raise UnsupportedOption(format, 'solid')
-            cmd = ['lha', 'a', outpath, '--']
-        elif 'rar' == format:
-            cmd = ['rar', 'a', '-r']
-            cmd.append('-s' if solid else '-s-')
-            if password is not None:
-                if header_encryption:
-                    cmd.append('-hp' + password)
-                else:
-                    cmd.append('-p' + password)
-            else:
-                assert not header_encryption
-            cmd.extend(('--', outpath))
-        elif format.startswith('tar'):
-            assert password is None
-            assert not header_encryption
-            if not solid:
-                raise UnsupportedOption(format, 'not solid')
-            if 'tar' == format:
-                compression = ''
-            elif 'tar.bz2' == format:
-                compression = 'j'
-            elif 'tar.gz' == format:
-                compression = 'z'
-            elif 'tar.xz' == format:
-                compression = 'J'
-            else:
-                raise UnsupportedFormat(format)
-            cmd = ['tar', '-cv%sf' % compression, outpath, '--']
-            # entry_list = [ name.replace('\\', '\\\\') for name in entry_list]
-        elif 'zip' == format:
-            assert not header_encryption
-            if solid:
-                raise UnsupportedOption(format, 'solid')
-            cmd = ['zip', '-r']
-            if password is not None:
-                cmd.extend(['-P', password])
-            cmd.extend([outpath, '--'])
-        else:
-            raise UnsupportedFormat(format)
-        cmd.extend(entry_list)
-        cwd = os.getcwd()
-        cleanup.append(lambda: os.chdir(cwd))
-        os.chdir(tmp_dir)
-        proc = process.popen(cmd, stderr=process.PIPE)
-        cleanup.append(proc.stdout.close)
-        cleanup.append(proc.stderr.close)
-        cleanup.append(proc.wait)
-        stdout, stderr = proc.communicate()
-    finally:
-        for fn in reversed(cleanup):
-            fn()
-    if not os.path.exists(outfile):
-        raise Exception('archive creation failed: %s\nstdout:\n%s\nstderr:\n%s\n' % (
-            ' '.join(cmd), stdout, stderr
-        ))
 
 def md5(path):
     hash = hashlib.md5()
@@ -142,10 +27,15 @@ def md5(path):
 
 class ArchiveFormatTest(object):
 
+    # Removed from unittest in Python 3.
+    assertItemsEqual = unittest.TestCase.assertCountEqual
+
     skip = None
     handler = None
     format = ''
     solid = False
+    # Expected supports_random_access(); None means "not solid".
+    random_access = None
     password = None
     header_encryption = False
     contents = ()
@@ -167,22 +57,13 @@ class ArchiveFormatTest(object):
             for name, archive_name, filename
             in cls.contents
         ])
-        mcomix.archive.ask_for_password = cls._ask_password
-        if os.path.exists(cls.archive_path):
-            return
-        if 'win32' == sys.platform:
-            raise Exception('archive creation unsupported on Windows!')
-        make_archive(cls.archive_path,
-                     [(name, get_testfile_path(filename))
-                      for name, archive_name, filename
-                      in cls.contents],
-                     format=cls.format,
-                     solid=cls.solid,
-                     password=cls.password,
-                     header_encryption=cls.header_encryption)
 
     def setUp(self):
         super(ArchiveFormatTest, self).setUp()
+        prompt = mock.patch.object(mcomix.archive.password, 'ask_for_password',
+                                   self._ask_password)
+        prompt.start()
+        self.addCleanup(prompt.stop)
         self.dest_dir = tempfile.mkdtemp(prefix='extract.')
         self.archive = None
 
@@ -191,33 +72,14 @@ class ArchiveFormatTest(object):
             self.archive.close()
         super(ArchiveFormatTest, self).tearDown()
 
-    def test_init_not_unicode(self):
-        self.assertRaises(AssertionError, self.handler, 'test')
-
-    def test_archive(self):
-        self.archive = self.handler(self.archive_path)
-        self.assertEqual(self.archive.archive, self.archive_path)
-
     def test_list_contents(self):
         self.archive = self.handler(self.archive_path)
         contents = self.archive.list_contents()
         self.assertItemsEqual(contents, list(self.archive_contents.keys()))
 
-    def test_iter_contents(self):
-        self.archive = self.handler(self.archive_path)
-        contents = []
-        for name in self.archive.iter_contents():
-            contents.append(name)
-        self.assertItemsEqual(contents, list(self.archive_contents.keys()))
-
     def test_is_solid(self):
         self.archive = self.handler(self.archive_path)
         self.archive.list_contents()
-        self.assertEqual(self.solid, self.archive.is_solid())
-
-    def test_iter_is_solid(self):
-        self.archive = self.handler(self.archive_path)
-        list(self.archive.iter_contents())
         self.assertEqual(self.solid, self.archive.is_solid())
 
     def test_extract(self):
@@ -249,6 +111,44 @@ class ArchiveFormatTest(object):
         # (necessary to prevent bad performances on solid archives)
         self.assertEqual(extracted, contents)
 
+    def test_read(self):
+        self.archive = self.handler(self.archive_path)
+        contents = self.archive.list_contents()
+        self.assertItemsEqual(contents, list(self.archive_contents.keys()))
+        # Use out-of-order reads to try to trip implementation.
+        for name in reversed(contents):
+            data = self.archive.read(name)
+            original_md5 = md5(get_testfile_path(self.archive_contents[name]))
+            self.assertEqual((name, hashlib.md5(data).hexdigest()), (name, original_md5))
+
+    def test_read_and_extract(self):
+        self.archive = self.handler(self.archive_path)
+        contents = self.archive.list_contents()
+        # Interleave reads and extractions: they share the archive state.
+        for n, name in enumerate(reversed(contents)):
+            original_md5 = md5(get_testfile_path(self.archive_contents[name]))
+            if n % 2:
+                data = self.archive.read(name)
+                self.assertEqual((name, hashlib.md5(data).hexdigest()), (name, original_md5))
+            else:
+                self.archive.extract(name, self.dest_dir)
+                path = os.path.join(self.dest_dir, name)
+                self.assertEqual((name, md5(path)), (name, original_md5))
+
+    def test_get_entry_size(self):
+        self.archive = self.handler(self.archive_path)
+        for name in self.archive.list_contents():
+            size = self.archive.get_entry_size(name)
+            if size is not None:
+                original_size = os.path.getsize(get_testfile_path(self.archive_contents[name]))
+                self.assertEqual((name, size), (name, original_size))
+
+    def test_supports_random_access(self):
+        self.archive = self.handler(self.archive_path)
+        self.archive.list_contents()
+        expected = not self.solid if self.random_access is None else self.random_access
+        self.assertEqual(expected, self.archive.supports_random_access())
+
 
 class RecursiveArchiveFormatTest(ArchiveFormatTest):
 
@@ -259,6 +159,13 @@ class RecursiveArchiveFormatTest(ArchiveFormatTest):
         return archive_recursive.RecursiveArchive(main_archive, self.dest_dir)
 
 
+RECURSIVE_TWINS = {
+    'ArchiveFormatZipFlatTest',
+    'ArchiveFormatTarSolidFlatTest',
+    'ArchiveFormatTarGzipSolidFlatTest',
+    'ArchiveFormatZipEncryptedTest',
+}
+
 for name, handler, is_available, format, not_solid, solid, password, header_encryption in (
     ('7z (external)'    , sevenzip_external.SevenZipArchive, sevenzip_external.SevenZipArchive.is_available(), '7z'     , True , True , True , True  ),
     ('7z (external) lha', sevenzip_external.SevenZipArchive, sevenzip_external.SevenZipArchive.is_available(), 'lha'    , True , False, False, False ),
@@ -267,10 +174,7 @@ for name, handler, is_available, format, not_solid, solid, password, header_encr
     ('tar'              , tar.TarArchive                   , True                                            , 'tar'    , False, True , False, False ),
     ('tar (gzip)'       , tar.TarArchive                   , True                                            , 'tar.gz' , False, True , False, False ),
     ('tar (bzip2)'      , tar.TarArchive                   , True                                            , 'tar.bz2', False, True , False, False ),
-    ('rar (external)'   , rar_external.RarArchive          , rar_external.RarArchive.is_available()          , 'rar'    , True , True , True , True  ),
-    ('rar (dll)'        , rar.RarArchive                   , rar.RarArchive.is_available()                   , 'rar'    , True , True , True , True  ),
     ('zip'              , zip.ZipArchive                   , True                                            , 'zip'    , True , False, True , False ),
-    ('zip (external)'   , zip_external.ZipArchive          , zip_external.ZipArchive.is_available()          , 'zip'    , True , False, True , False ),
 ):
     base_class_name = 'ArchiveFormat'
     base_class_name += ''.join([part.capitalize() for part in re.sub(r'[^\w]+', ' ', name).split()])
@@ -280,6 +184,9 @@ for name, handler, is_available, format, not_solid, solid, password, header_encr
         'handler': handler,
         'format': format,
     }
+    if 'tar' == format:
+        # Always "solid", but uncompressed entries can be read directly.
+        base_class_dict['random_access'] = True
 
     skip = None
     if not is_available:
@@ -384,6 +291,9 @@ for name, handler, is_available, format, not_solid, solid, password, header_encr
         class_dict.update(params)
         class_dict['archive'] = variant
         globals()[class_name] = type(class_name, (ArchiveFormatTest, MComixTest), class_dict)
+        # RecursiveArchive only delegates, so a few in-process twins cover it.
+        if class_name not in RECURSIVE_TWINS:
+            continue
         class_name = 'Recursive' + class_name
         class_dict = dict(class_dict)
         class_dict['base_handler'] = class_dict['handler']
@@ -413,7 +323,8 @@ class RecursiveArchiveFormatRedAndBluesTest(RecursiveArchiveFormatTest):
 class RecursiveArchiveFormatTarRedAndBluesTest(RecursiveArchiveFormatRedAndBluesTest, MComixTest):
 
     base_handler = tar.TarArchive
-    is_available = True
+    # Sub-archives need 7z support.
+    is_available = sevenzip_external.SevenZipArchive.is_available()
     archive_path = get_testfile_path('archives', 'red_and_blues.tar')
     contents = (
         ('red_and_blues.7z/blues.rar/blue0.png', 'images/blue.png'),
@@ -430,7 +341,7 @@ class RecursiveArchiveFormatTarRedAndBluesTest(RecursiveArchiveFormatRedAndBlues
 class RecursiveArchiveFormat7zRedAndBluesTest(RecursiveArchiveFormatRedAndBluesTest, MComixTest):
 
     base_handler = sevenzip_external.SevenZipArchive
-    is_available = rar.RarArchive.is_available()
+    is_available = sevenzip_external.SevenZipArchive.is_available()
     archive_path = get_testfile_path('archives', 'red_and_blues.7z')
     contents = (
         ('blues.rar/blue0.png', 'images/blue.png'),
@@ -440,10 +351,10 @@ class RecursiveArchiveFormat7zRedAndBluesTest(RecursiveArchiveFormatRedAndBluesT
     )
     solid = True
 
-class RecursiveArchiveFormatExternalRarRedAndBluesTest(RecursiveArchiveFormatRedAndBluesTest, MComixTest):
+class RecursiveArchiveFormat7zRarRedAndBluesTest(RecursiveArchiveFormatRedAndBluesTest, MComixTest):
 
-    base_handler = rar_external.RarArchive
-    is_available = rar_external.RarArchive.is_available()
+    base_handler = sevenzip_external.SevenZipArchive
+    is_available = sevenzip_external.SevenZipArchive.is_available()
     archive_path = get_testfile_path('archives', 'red_and_blues.rar')
     contents = (
         ('blues.7z/blue0.png', 'images/blue.png'),
@@ -453,7 +364,7 @@ class RecursiveArchiveFormatExternalRarRedAndBluesTest(RecursiveArchiveFormatRed
     )
     solid = True
 
-class RecursiveArchiveFormatExternalRarEmbeddedRedAndBluesRarTest(RecursiveArchiveFormatExternalRarRedAndBluesTest):
+class RecursiveArchiveFormat7zRarEmbeddedRedAndBluesRarTest(RecursiveArchiveFormat7zRarRedAndBluesTest):
 
     archive_path = get_testfile_path('archives', 'embedded_red_and_blues_rar.rar')
     contents = (
@@ -463,80 +374,19 @@ class RecursiveArchiveFormatExternalRarEmbeddedRedAndBluesRarTest(RecursiveArchi
         ('red_and_blues.rar/red.png'           , 'images/red.png' ),
     )
 
-class RecursiveArchiveFormatRarRedAndBluesTest(RecursiveArchiveFormatExternalRarRedAndBluesTest):
-
-    base_handler = rar.RarArchive
-    is_available = rar.RarArchive.is_available()
-
-class RecursiveArchiveFormatRarEmbeddedRedAndBluesRarTest(RecursiveArchiveFormatExternalRarEmbeddedRedAndBluesRarTest):
-
-    base_handler = rar.RarArchive
-    is_available = rar.RarArchive.is_available()
-
-class RecursiveArchiveFormat7zExternalTarXzTest(RecursiveArchiveFormatTest, MComixTest):
-
-    base_handler = sevenzip_external.TarArchive
-    is_available = sevenzip_external.TarArchive.is_available()
-    solid = True
-    format = 'tar.xz'
-    archive = 'SolidFlat'
-    contents = (
-        ('arg.jpeg', os.path.join('archive.tar', 'arg.jpeg'), 'images/01-JPG-Indexed.jpg'),
-        ('foo.JPG' , os.path.join('archive.tar', 'foo.JPG' ), 'images/04-PNG-Indexed.png'),
-        ('bar.jpg' , os.path.join('archive.tar', 'bar.jpg' ), 'images/02-JPG-RGB.jpg'    ),
-        ('meh.png' , os.path.join('archive.tar', 'meh.png' ), 'images/03-PNG-RGB.png'    ),
-    )
-
 xfail_list = [
-    # No password support when using some external tools.
-    ('ZipExternalEncrypted'             , 'test_extract'      ),
-    ('ZipExternalEncrypted'             , 'test_iter_extract' ),
-]
+    # Not supported by 7z executable...
+    ('7zExternalLhaUnicode'   , 'test_list_contents'),
+    ('7zExternalLhaUnicode'   , 'test_iter_extract' ),
+    ('7zExternalLhaUnicode'   , 'test_extract'      ),
+] if 'win32' == sys.platform else []
 
-if 'win32' == sys.platform:
-    xfail_list.extend([
-        # Bug...
-        ('RarDllGlobEntries'      , 'test_iter_contents'),
-        ('RarDllGlobEntries'      , 'test_list_contents'),
-        ('RarDllGlobEntries'      , 'test_iter_extract' ),
-        ('RarDllGlobEntries'      , 'test_extract'      ),
-        ('RarDllSolidGlobEntries' , 'test_iter_contents'),
-        ('RarDllSolidGlobEntries' , 'test_list_contents'),
-        ('RarDllSolidGlobEntries' , 'test_iter_extract' ),
-        ('RarDllSolidGlobEntries' , 'test_extract'      ),
-        # Not supported by 7z executable...
-        ('7zExternalLhaUnicode'   , 'test_iter_contents'),
-        ('7zExternalLhaUnicode'   , 'test_list_contents'),
-        ('7zExternalLhaUnicode'   , 'test_iter_extract' ),
-        ('7zExternalLhaUnicode'   , 'test_extract'      ),
-        # Unicode not supported by the tar executable we used.
-        ('TarBzip2SolidUnicode'   , 'test_iter_contents'),
-        ('TarBzip2SolidUnicode'   , 'test_list_contents'),
-        ('TarBzip2SolidUnicode'   , 'test_iter_extract' ),
-        ('TarBzip2SolidUnicode'   , 'test_extract'      ),
-        ('TarGzipSolidUnicode'    , 'test_iter_contents'),
-        ('TarGzipSolidUnicode'    , 'test_list_contents'),
-        ('TarGzipSolidUnicode'    , 'test_iter_extract' ),
-        ('TarGzipSolidUnicode'    , 'test_extract'      ),
-        ('TarSolidUnicode'        , 'test_iter_contents'),
-        ('TarSolidUnicode'        , 'test_list_contents'),
-        ('TarSolidUnicode'        , 'test_iter_extract' ),
-        ('TarSolidUnicode'        , 'test_extract'      ),
-        # Idem with unzip...
-        ('ZipExternalUnicode'     , 'test_iter_contents'),
-        ('ZipExternalUnicode'     , 'test_list_contents'),
-        ('ZipExternalUnicode'     , 'test_iter_extract' ),
-        ('ZipExternalUnicode'     , 'test_extract'      ),
-        # ...and unrar!
-        ('RarExternalUnicode'     , 'test_iter_contents'),
-        ('RarExternalUnicode'     , 'test_list_contents'),
-        ('RarExternalUnicode'     , 'test_iter_extract' ),
-        ('RarExternalUnicode'     , 'test_extract'      ),
-        ('RarExternalSolidUnicode', 'test_iter_contents'),
-        ('RarExternalSolidUnicode', 'test_list_contents'),
-        ('RarExternalSolidUnicode', 'test_iter_extract' ),
-        ('RarExternalSolidUnicode', 'test_extract'      ),
-    ])
+# Reading in memory fails where extracting or listing does.
+for test, attr in list(xfail_list):
+    if 'test_extract' == attr:
+        xfail_list.extend(((test, 'test_read'), (test, 'test_read_and_extract')))
+    elif 'test_list_contents' == attr:
+        xfail_list.append((test, 'test_get_entry_size'))
 
 # Expected failures.
 for test, attr in xfail_list:
@@ -547,5 +397,10 @@ for test, attr in xfail_list:
         if not name in globals():
             continue
         klass = globals()[name]
-        setattr(klass, attr, unittest.expectedFailure(getattr(klass, attr)))
+        # Wrap first: the test function is shared with all other classes
+        # (inherited from ArchiveFormatTest), and expectedFailure marks the
+        # function object itself.
+        func = getattr(klass, attr)
+        wrapper = functools.wraps(func)(lambda self, func=func: func(self))
+        setattr(klass, attr, unittest.expectedFailure(wrapper))
 

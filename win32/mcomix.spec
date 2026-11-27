@@ -4,9 +4,6 @@
 import glob
 import os
 
-block_cipher = None
-
-
 def list_files(basedir, *patterns):
     """ Locates all files in <basedir> that match one of <patterns>. """
 
@@ -26,7 +23,19 @@ added_files = [(os.path.join('..', path),
                for path in list_files('mcomix/messages', '*.mo')]
 added_files.extend([(os.path.join('..', path),
                      os.path.split(path)[0])
-                    for path in list_files('mcomix/images', '*.png')])
+                    for path in list_files('mcomix/images', '*.png', '*.svg')])
+added_files.extend([(os.path.join('..', path),
+                     os.path.split(path)[0])
+                    for path in list_files('mcomix/upscale_models', '*.onnx', '*.md')])
+
+# windowsml loads its DLL with ctypes, which PyInstaller cannot see.
+# Check its license terms before distributing (see win32/README.md).
+try:
+    from PyInstaller.utils.hooks import collect_dynamic_libs
+    added_binaries = (collect_dynamic_libs('windowsml')
+                      + collect_dynamic_libs('onnxruntime'))
+except Exception:
+    added_binaries = []
 
 attach_console = True
 if 'PYINSTALLER_CONSOLE' in os.environ:
@@ -34,21 +43,18 @@ if 'PYINSTALLER_CONSOLE' in os.environ:
 
 a = Analysis(['../mcomixstarter.py'],
              pathex=[],
-             binaries=[],
+             binaries=added_binaries,
              datas=added_files,
              hiddenimports=[],
              hookspath=[],
              hooksconfig={},
              runtime_hooks=[],
-             excludes=[],
+             excludes=['torch', 'spandrel', 'onnx', 'onnxscript'],
              win_no_prefer_redirects=False,
              win_private_assemblies=False,
-             cipher=block_cipher,
              noarchive=False)
 
-pyz = PYZ(a.pure,
-          a.zipped_data,
-          cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(pyz,
           a.scripts,
@@ -62,13 +68,12 @@ exe = EXE(pyz,
           console=attach_console,
           disable_windowed_traceback=False,
           target_arch=None,
-          version='version_file.txt',
+          version=os.path.join(SPECPATH, 'version_file.txt'),
           codesign_identity=None,
           entitlements_file=None , icon='../mcomix/images/mcomix.ico')
 
 coll = COLLECT(exe,
                a.binaries,
-               a.zipfiles,
                a.datas,
                strip=False,
                upx=True,

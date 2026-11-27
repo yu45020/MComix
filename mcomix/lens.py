@@ -1,7 +1,5 @@
 """lens.py - Magnifying lens."""
 
-import math
-
 from gi.repository import Gdk, GdkPixbuf, Gtk
 
 from mcomix.preferences import prefs
@@ -63,10 +61,19 @@ class MagnifyingLens(object):
         if self._window.images[0].get_storage_type() not in (Gtk.ImageType.PIXBUF,
             Gtk.ImageType.ANIMATION):
             return
+        # Until the redraw runs, the layout's boxes belong to the previous page.
+        if self._window._waiting_for_redraw or self._window._pending_decode_redraw is not None:
+            self._clear_lens()
+            return
 
         lens_size = (prefs['lens size'],) * 2 # 2D only
         border_size = 1
         rectangle = self._calculate_lens_rect(x, y, *lens_size, border_size)
+        pixbuf = self._get_lens_pixbuf(x, y, lens_size, border_size,
+            (x - rectangle[0], y - rectangle[1]))
+        if pixbuf is None:
+            self._clear_lens()
+            return
 
         draw_region = Gdk.Rectangle()
         draw_region.x, draw_region.y, draw_region.width, draw_region.height = rectangle
@@ -75,8 +82,6 @@ class MagnifyingLens(object):
             last_region.x, last_region.y, last_region.width, last_region.height = self._last_lens_rect
             draw_region = Gdk.rectangle_union(draw_region, last_region)
 
-        pixbuf = self._get_lens_pixbuf(x, y, lens_size, border_size,
-            (x - rectangle[0], y - rectangle[1]))
         window = self._window._main_layout.get_bin_window()
         window.begin_paint_rect(draw_region)
 
@@ -107,7 +112,7 @@ class MagnifyingLens(object):
 
         return lens_x, lens_y, width + 2 * border_size, height + 2 * border_size
 
-    def _clear_lens(self, current_lens_region=None):
+    def _clear_lens(self):
         """ Invalidates the area that was damaged by the last call to draw_lens. """
 
         if not self._last_lens_rect:
@@ -132,32 +137,48 @@ class MagnifyingLens(object):
 
     def _get_lens_pixbuf(self, x, y, lens_size, border_size, check_offset):
         """Get a pixbuf containing the appropiate image data for the lens
-        where <x> and <y> are the positions of the cursor.
+        where <x> and <y> are the positions of the cursor, or None while the
+        pages are not decoded yet.
         """
         cb = self._window.layout.get_content_boxes()
-        source_pixbufs = self._window.imagehandler.get_pixbufs(len(cb))
-        transforms = self._window.transforms
+        source_pixbufs = self._window.imagehandler.get_pixbufs(len(cb), block=False)
+        if source_pixbufs is None:
+            return None
+        animations = self._window.imagehandler.animations
+        # A playing WebP's displayed frame is already scaled, transformed and
+        # enhanced, so it is drawn untransformed after the canvas is enhanced.
+        static = []
+        displayed = []
+        for i, (b, source_pixbuf, tf) in enumerate(zip(cb, source_pixbufs,
+                                                       self._window.transforms)):
+            frame = animations.displayed(i)
+            if frame is not None:
+                displayed.append((b, frame))
+            elif not image_tools.is_animation(source_pixbuf):
+                static.append((b, source_pixbuf, tf))
         lens_scale = (prefs['lens magnification'],) * 2 # 2D only
         opaque = prefs['checkered bg for transparent images'] or not any(
-            map(GdkPixbuf.Pixbuf.get_has_alpha, source_pixbufs))
+            p.get_has_alpha() for p in [s[1] for s in static] + [d[1] for d in displayed])
         canvas = GdkPixbuf.Pixbuf.new(colorspace=GdkPixbuf.Colorspace.RGB,
             has_alpha=not opaque, bits_per_sample=8, width=lens_size[0],
             height=lens_size[1]) # 2D only
         canvas.fill(image_tools.convert_rgb16list_to_rgba8int(self._window.get_bg_colour()))
-        for b, source_pixbuf, tf in zip(cb, source_pixbufs, transforms):
-            if image_tools.is_animation(source_pixbuf):
-                continue
+
+        def draw(b, source_pixbuf, rotation, flips):
             cpos = b.get_position()
-            _scale, rotation, flips = tf.to_image_transforms() # FIXME use scale as soon as it is correctly included
             composite_color_args = image_tools.get_composite_color_args(0) if \
                 source_pixbuf.get_has_alpha() and opaque else None
             self._draw_lens_pixbuf((x - cpos[0], y - cpos[1]), b.get_size(),
                 source_pixbuf, rotation, flips,
-                lens_size, lens_scale, canvas, prefs['scaling quality'],
+                lens_size, lens_scale, canvas, image_tools.gdk_scaling_quality(),
                 composite_color_args, (x - border_size - check_offset[0],
                 y - border_size - check_offset[1])) # 2D only
 
+        for b, source_pixbuf, tf in static:
+            draw(b, source_pixbuf, *tf.to_image_transforms())
         canvas = self._window.enhancer.enhance(canvas)
+        for b, frame in displayed:
+            draw(b, frame, 0, (False, False))
 
         return image_tools.add_border(canvas, border_size)
 
@@ -263,10 +284,6 @@ class MagnifyingLens(object):
                         *neg_mapped_lens_pos, *applied_source_scale, interpolation,
                         255, *tools.vector_add(dest_lens_offset, check_offset),
                         *composite_color_args) # 2D only
-        else:
-            # If we are here, there is either no image to be drawn at all, or it is
-            # out of range.
-            pass
         return dstbuf
 
 

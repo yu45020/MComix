@@ -1,12 +1,55 @@
 """ Data class for library books and collections. """
 
 import os
+import re
+from functools import lru_cache
 import threading
 import datetime
+from typing import List, Optional, Tuple
+
+from gi.repository import GLib
 
 from mcomix import callback
 from mcomix import archive_tools
+from mcomix import log
 from mcomix.i18n import _
+
+
+@lru_cache(maxsize=128)
+def _search_segments(filter_string: str) -> Tuple['re.Pattern[str]', ...]:
+    """Compile the parts between % wildcards; _ matches one character.
+
+    The parts contain no repetition, so matching never backtracks.
+    """
+    return tuple(re.compile(''.join('.' if char == '_' else re.escape(char)
+                                    for char in part),
+                            re.IGNORECASE | re.DOTALL)
+                 for part in filter_string.split('%') if part)
+
+
+def _matches_segments(value: str, segments: Tuple['re.Pattern[str]', ...]) -> bool:
+    # Each % may skip any text, so the leftmost match of every part suffices.
+    position = 0
+    for segment in segments:
+        match = segment.search(value, position)
+        if match is None:
+            return False
+        position = match.end()
+    return True
+
+
+def matches_filter(name: Optional[str], path: Optional[str],
+                   filter_string: Optional[str]) -> bool:
+    """Search names and paths with case-insensitive LIKE substrings.
+
+    Percent matches any run of characters and underscore exactly one. Other
+    characters, including brackets and backslashes, are literal.
+    """
+    if not filter_string:
+        return True
+    segments = _search_segments(filter_string)
+    return any(value is not None and _matches_segments(value, segments)
+               for value in (name, path))
 
 
 class _BackendObject(object):
@@ -133,64 +176,20 @@ class _Collection(_BackendObject):
         """ Returns all books that are part of this collection,
         including subcollections. """
 
-        books = []
-        for collection in [ self ] + self.get_all_collections():
-            sql = '''SELECT book.id, book.name, book.path, book.pages, book.format,
-                            book.size, book.added
-                     FROM book
-                     JOIN contain ON contain.book = book.id
-                                     AND contain.collection = ?
-                  '''
-
-            sql_args = [collection.id]
-            if filter_string:
-                sql += ''' WHERE book.name LIKE '%' || ? || '%' '''
-                sql_args.append(filter_string)
-                sql += ''' OR book.path LIKE '%' || ? || '%' '''
-                sql_args.append(filter_string)
-
-            cursor = self.get_backend().execute(sql, sql_args)
-            rows = cursor.fetchall()
-            cursor.close()
-
-            books.extend([ _Book(*cols) for cols in rows ])
-
-        return books
-
-    def get_collections(self):
-        """ Returns a list of all direct subcollections of this instance. """
-
-        cursor = self.get_backend().execute('''SELECT id, name, supercollection
-                FROM collection
-                WHERE supercollection = ?
-                ORDER by name''', [self.id])
-        result = cursor.fetchall()
+        backend = self.get_backend()
+        collections = [self.id] + backend.get_all_collections_in_collection(self.id)
+        sql = '''SELECT book.id, book.name, book.path, book.pages, book.format,
+                        book.size, book.added
+                 FROM book
+                 WHERE book.id IN (SELECT book FROM contain
+                                   WHERE collection IN (%s))
+              ''' % ','.join('?' * len(collections))
+        cursor = backend.execute(sql, collections)
+        rows = cursor.fetchall()
         cursor.close()
 
-        return [ _Collection(*row) for row in result ]
-
-    def get_all_collections(self):
-        """ Returns all collections that are subcollections of this instance,
-        or subcollections of a subcollection of this instance. """
-
-        to_search = [ self ]
-        collections = [ ]
-        # This assumes that the library is built like a tree, so no circular references.
-        while len(to_search) > 0:
-            collection = to_search.pop()
-            subcollections = collection.get_collections()
-            collections.extend(subcollections)
-            to_search.extend(subcollections)
-
-        return collections
-
-    def add_collection(self, subcollection):
-        """ Sets C{subcollection} as child of this collection. """
-
-        self.get_backend().execute('''UPDATE collection
-                SET supercollection = ?
-                WHERE id = ?''', (self.id, subcollection.id))
-        subcollection.supercollection = self.id
+        return [_Book(*cols) for cols in rows
+                if matches_filter(cols[1], cols[2], filter_string)]
 
 
 class _DefaultCollection(_Collection):
@@ -211,40 +210,12 @@ class _DefaultCollection(_Collection):
               '''
 
         sql_args = []
-        if filter_string:
-            sql += ''' WHERE book.name LIKE '%' || ? || '%' '''
-            sql_args.append(filter_string)
-            sql += ''' OR book.path LIKE '%' || ? || '%' '''
-            sql_args.append(filter_string)
-
         cursor = self.get_backend().execute(sql, sql_args)
         rows = cursor.fetchall()
         cursor.close()
 
-        return [ _Book(*cols) for cols in rows ]
-
-    def add_collection(self, subcollection):
-        """ Removes C{subcollection} from any supercollections and moves
-        it to the root level of the tree. """
-
-        assert subcollection is not DefaultCollection, "Cannot change DefaultCollection"
-
-        self.get_backend().execute('''UPDATE collection
-                SET supercollection = NULL
-                WHERE id = ?''', (subcollection.id,))
-        subcollection.supercollection = None
-
-    def get_collections(self):
-        """ Returns a list of all root collections. """
-
-        cursor = self.get_backend().execute('''SELECT id, name, supercollection
-                FROM collection
-                WHERE supercollection IS NULL
-                ORDER by name''')
-        result = cursor.fetchall()
-        cursor.close()
-
-        return [ _Collection(*row) for row in result ]
+        return [_Book(*cols) for cols in rows
+                if matches_filter(cols[1], cols[2], filter_string)]
 
 
 DefaultCollection = _DefaultCollection()
@@ -257,6 +228,12 @@ class _WatchList(object):
 
     def __init__(self, backend):
         self.backend = backend
+        self._scan_lock = threading.Lock()
+        self._scan_thread = None
+        self._scan_cancel = threading.Event()
+        self._scan_generation = 0
+        self._scan_closed = False
+        self._scan_stopping = False
 
     def add_directory(self, path, collection=DefaultCollection, recursive=False):
         """ Adds a new watched directory. """
@@ -303,22 +280,77 @@ class _WatchList(object):
         else:
             raise ValueError("Watchlist entry doesn't exist")
 
-    def scan_for_new_files(self):
-        """ Begins scanning for new files in the watched directories.
-        When the scan finishes, L{new_files_found} will be called
-        asynchronously. """
-        thread = threading.Thread(target=self._scan_for_new_files_thread)
-        thread.name += '-scan_for_new_files'
-        thread.start()
+    def scan_for_new_files(self) -> bool:
+        """Start one scan, snapshotting database state before filesystem work."""
+        with self._scan_lock:
+            if self._scan_closed or self._scan_stopping:
+                return False
+            if self._scan_thread is not None:
+                if self._scan_thread.is_alive():
+                    return False
+            books = DefaultCollection.get_books()
+            # A Recent-only book is new to a collection entry, which files
+            # it there, but not to an All books entry, which adds nothing.
+            all_books = [book.path for book in books]
+            filed_books = [book.path for book in books
+                           if book.get_collections() != [-2]]
+            entries = [(entry, all_books if entry.collection.id is None else filed_books)
+                       for entry in self.get_watchlist()]
+            self._scan_generation += 1
+            generation = self._scan_generation
+            cancel = threading.Event()
+            self._scan_cancel = cancel
+            self._scan_thread = threading.Thread(
+                target=self._scan_for_new_files_thread,
+                args=(generation, cancel, entries),
+                name='scan_for_new_files', daemon=False)
+            self._scan_thread.start()
+            return True
 
-    def _scan_for_new_files_thread(self):
-        """ Executes the actual scanning operation in a new thread. """
-        existing_books = [book.path for book in DefaultCollection.get_books()
-                          # Also add book if it was only found in Recent collection
-                          if book.get_collections() != [-2]]
-        for entry in self.get_watchlist():
-            new_files = entry.get_new_files(existing_books)
-            self.new_files_found(new_files, entry)
+    def stop_scan(self, shutdown: bool = False) -> None:
+        """Cancel and join the owned scan before releasing database resources.
+
+        Cancellation is checked between filesystem operations. A blocked OS
+        directory read must return before its worker can safely be joined.
+        """
+        with self._scan_lock:
+            self._scan_stopping = True
+            self._scan_closed = self._scan_closed or shutdown
+            self._scan_generation += 1
+            self._scan_cancel.set()
+            thread = self._scan_thread
+        if thread is not None:
+            thread.join()
+        with self._scan_lock:
+            if self._scan_thread is thread:
+                self._scan_thread = None
+            self._scan_stopping = False
+
+    def _scan_for_new_files_thread(self, generation: int, cancel: threading.Event,
+                                   entries: List[Tuple['_WatchListEntry', List[str]]]) -> None:
+        """Only filesystem work runs here; database snapshots belong to GTK."""
+        for entry, existing_books in entries:
+            if cancel.is_set():
+                return
+            try:
+                new_files = entry.get_new_files(existing_books, cancel)
+            except OSError as error:
+                log.warning(_('Could not scan directory %(directory)s: %(error)s'),
+                            {'directory': entry.directory, 'error': error})
+                continue
+            if cancel.is_set():
+                return
+            GLib.idle_add(self._publish_new_files, generation, cancel,
+                          new_files, entry)
+
+    def _publish_new_files(self, generation: int, cancel: threading.Event,
+                           paths: List[str], entry: '_WatchListEntry') -> bool:
+        """Discard queued scan results after cancellation, restart or shutdown."""
+        if self._scan_closed or cancel.is_set():
+            return False
+        if generation == self._scan_generation:
+            self.new_files_found(paths, entry)
+        return False
 
     def _result_row_to_watchlist_entry(self, row):
         """ Converts the result of a SELECT statement to a WatchListEntry. """
@@ -349,29 +381,35 @@ class _WatchListEntry(_BackendObject):
         self.recursive = bool(recursive)
         self.collection = collection
 
-    def get_new_files(self, filelist):
-        """ Returns a list of files that are present in the watched directory,
-        but not in the list of files passed in C{filelist}. """
-
-        if not self.is_valid():
+    def get_new_files(self, filelist: List[str],
+                      cancel: Optional[threading.Event] = None) -> List[str]:
+        """Find new archives, checking cancellation between filesystem calls."""
+        if cancel is None:
+            cancel = threading.Event()
+        if cancel.is_set() or not self.is_valid() or cancel.is_set():
             return []
 
-        old_files = frozenset([os.path.abspath(path) for path in filelist])
-
+        old_files = frozenset(os.path.normcase(os.path.abspath(path)) for path in filelist)
+        available_files = set()
         if not self.recursive:
-            available_files = frozenset([os.path.join(self.directory, filename)
-                for filename in os.listdir(self.directory)
-                if archive_tools.is_archive_file(filename)])
+            filenames = os.listdir(self.directory)
+            for filename in filenames:
+                if cancel.is_set():
+                    return []
+                if archive_tools.is_archive_file(filename):
+                    available_files.add(os.path.join(self.directory, filename))
         else:
-            available_files = []
             for dirpath, dirnames, filenames in os.walk(self.directory):
-                for filename in filter(archive_tools.is_archive_file, filenames):
-                    path = os.path.join(dirpath, filename)
-                    available_files.append(path)
+                if cancel.is_set():
+                    return []
+                for filename in filenames:
+                    if cancel.is_set():
+                        return []
+                    if archive_tools.is_archive_file(filename):
+                        available_files.add(os.path.join(dirpath, filename))
 
-            available_files = frozenset(available_files)
-
-        return list(available_files.difference(old_files))
+        return [path for path in available_files
+                if os.path.normcase(path) not in old_files]
 
     def is_valid(self):
         """ Check if the watched directory is a valid directory and exists. """

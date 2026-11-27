@@ -6,11 +6,6 @@ from gi.repository import Pango
 from mcomix import labels
 from mcomix.i18n import _
 
-_dialog = None
-# The "All books" collection is not a real collection stored in the library,
-# but is represented by this ID in the library's TreeModels.
-_COLLECTION_ALL = -1
-
 class _AddLibraryProgressDialog(Gtk.Dialog):
 
     """Dialog with a ProgressBar that adds books to the library."""
@@ -28,6 +23,7 @@ class _AddLibraryProgressDialog(Gtk.Dialog):
         self.set_resizable(False)
         self.set_border_width(4)
         self.connect('response', self._response)
+        self.connect('destroy', self._on_destroy)
         self.set_default_response(Gtk.ResponseType.CLOSE)
 
         main_box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 5)
@@ -65,6 +61,9 @@ class _AddLibraryProgressDialog(Gtk.Dialog):
         total_added = 0
 
         for path in paths:
+            if self._destroy or library._closed:
+                self.destroy()
+                return
 
             if library.backend.add_book(path, collection):
                 total_added += 1
@@ -81,6 +80,9 @@ class _AddLibraryProgressDialog(Gtk.Dialog):
                 return
 
         self._response()
+
+    def _on_destroy(self, *args: object) -> None:
+        self._destroy = True
 
     def _response(self, *args):
         self._destroy = True

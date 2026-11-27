@@ -1,0 +1,36 @@
+# Dev environment: mamba env create -p ./.venv -f environment.yml
+# Refresh it:      mamba env update -p ./.venv -f environment.yml
+# GTK and the compiled packages come from conda-forge only; mixing in
+# Anaconda defaults builds breaks DLLs. The pip step takes the PyPI-only
+# packages (Windows ML, dev tools) from pyproject.toml's extras, and Pillow:
+# conda-forge builds it without libavif, the PyPI wheel reads AVIF. A prefix
+# that has conda-forge's pillow needs `mamba remove -p ./.venv pillow` before
+# the refresh, or pip keeps it.
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pygobject
+  - gtk3
+  # GTK's Adwaita theme draws its check and radio marks from SVG, and MComix
+  # its title-bar buttons. If the pixbuf warnings persist (or those buttons
+  # are blank) after creating or updating the prefix, run
+  # .venv\Library\bin\gdk-pixbuf-query-loaders.exe --update-cache
+  - librsvg
+  # Gtk.FileChooser aborts with "No GSettings schemas are installed" when the
+  # refresh leaves no gschemas.compiled; after creating or updating, run
+  # .venv\Library\bin\glib-compile-schemas.exe .venv\Library\share\glib-2.0\schemas
+  - pycairo
+  - numpy
+  # MComix never calls numpy's linear algebra, and the MKL build of libblas
+  # adds over 500 MB of DLLs to the portable build.
+  - libblas=*=*openblas
+  - pymupdf
+  - chardet
+  - pytest
+  - flake8
+  - pyinstaller
+  - pip
+  - pip:
+      - -e .[upscale,dev]

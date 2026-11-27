@@ -18,11 +18,11 @@ class _AboutDialog(Gtk.AboutDialog):
         self.set_name(constants.APPNAME)
         self.set_program_name(constants.APPNAME)
         self.set_version(constants.VERSION)
-        self.set_website('https://sourceforge.net/p/mcomix/wiki/')
-        self.set_copyright('Copyright © 2005-2022')
+        self.set_website(constants.HOMEPAGE)
+        self.set_copyright('Copyright © 2005-2026')
 
         icon_data = pkgutil.get_data('mcomix', 'images/mcomix.png')
-        pixbuf = image_tools.load_pixbuf_data(icon_data)
+        pixbuf = image_tools.load_pixbuf(icon_data)
         self.set_logo(pixbuf)
 
         comment = \

@@ -2,17 +2,19 @@
 import sys
 import os
 import re
+from typing import Iterator, List, Tuple
 from gi.repository import Gtk, GLib, GObject
 
 from mcomix.preferences import prefs
 from mcomix import message_dialog
 from mcomix import process
 from mcomix import callback
+from mcomix import constants
 from mcomix import i18n
 from mcomix.i18n import _
 
 
-DEBUGGING_CONTEXT, NO_FILE_CONTEXT, IMAGE_FILE_CONTEXT, ARCHIVE_CONTEXT = -1, 0, 1, 2
+NO_FILE_CONTEXT, IMAGE_FILE_CONTEXT, ARCHIVE_CONTEXT = 0, 1, 2
 
 
 class OpenWithException(Exception): pass
@@ -30,14 +32,9 @@ class OpenWithManager(object):
             for cmd in cmds]
 
     def get_commands(self):
-        try:
-            return [OpenWithCommand(label, command, cwd, disabled_for_archives)
-                    for label, command, cwd, disabled_for_archives
-                    in prefs['openwith commands']]
-        except ValueError:
-            # Backwards compatibility for early versions with only two parameters
-            return [OpenWithCommand(label, command, '', False)
-                    for label, command in prefs['openwith commands']]
+        return [OpenWithCommand(label, command, cwd, disabled_for_archives)
+                for label, command, cwd, disabled_for_archives
+                in prefs['openwith commands']]
 
 
 class OpenWithCommand(object):
@@ -71,6 +68,14 @@ class OpenWithCommand(object):
             window.osd.show(_("'%s' is disabled for archives.") % self.get_label())
             return
 
+        if (window.filehandler.archive_type is not None and
+            self._uses_page_path()):
+            # Archive pages might be read on demand: make sure the file
+            # exists. (%B and %S refer to the archive itself.)
+            if window.filehandler.materialize([window.imagehandler.get_path_to_page()]):
+                window.osd.show(_('Could not extract the selected page.'))
+                return
+
         current_dir = os.getcwd()
         try:
             if self.is_valid_workdir(window):
@@ -92,6 +97,26 @@ class OpenWithCommand(object):
             window.osd.show(text)
         finally:
             os.chdir(current_dir)
+
+    def _uses_page_path(self) -> bool:
+        """ Return True if the command or its working directory uses the
+        current page's path (%F) or directory (%D). """
+        return any(identifier in ('F', 'D')
+                   for text in (self.get_command(), self.get_cwd())
+                   for identifier in self._iter_variables(text))
+
+    @staticmethod
+    def _iter_variables(line: str) -> Iterator[str]:
+        """ Yield the identifiers of the variables in <line>, following the
+        escaping rules of _commandline_to_arguments(). """
+        escape = False
+        for c in line:
+            if escape:
+                if c != '%' and c != '"':
+                    yield c
+                escape = False
+            elif c == '%':
+                escape = True
 
     def is_executable(self, window):
         """ Check if a name is executable. This name can be either
@@ -126,22 +151,17 @@ class OpenWithCommand(object):
 
         return False
 
-    def parse(self, window, text='', check_restrictions=True):
+    def parse(self, window, text=''):
         """ Parses the command string and replaces special characters
         with their respective variable contents. Returns a list of
-        arguments.
-        If check_restrictions is False, no checking will be done
-        if one of the variables isn't valid in the current file context. """
+        arguments. """
         if not text:
             text = self.get_command()
         if not text.strip():
             raise OpenWithException(_('Command line is empty.'))
 
         args = self._commandline_to_arguments(text, window,
-            self._get_context_type(window, check_restrictions))
-        # Environment variables must be expanded after MComix variables,
-        # as win32 will eat %% and replace it with %.
-        args = [os.path.expandvars(arg) for arg in args]
+            self._get_context_type(window))
         return args
 
     def _commandline_to_arguments(self, line, window, context_type):
@@ -150,6 +170,7 @@ class OpenWithCommand(object):
         been contributed by Ark <aaku@users.sf.net>. """
         result = []
         buf = ""
+        parts = []
         quote = False
         escape = False
         inarg = False
@@ -158,14 +179,19 @@ class OpenWithCommand(object):
                 if c == '%' or c == '"':
                     buf += c
                 else:
-                    buf += self._expand_variable(c, window, context_type)
+                    # Only template text is environment-expanded. File names
+                    # supplied by MComix remain literal, including $ and %.
+                    parts.append((False, buf))
+                    buf = ""
+                    parts.append((True, self._expand_variable(c, window, context_type)))
                 escape = False
             elif c == ' ' or c == '\t':
                 if quote:
                     buf += c
                 elif inarg:
-                    result.append(buf)
+                    result.append(self._expand_argument(parts + [(False, buf)]))
                     buf = ""
+                    parts = []
                     inarg = False
             else:
                 if c == '"':
@@ -186,69 +212,71 @@ class OpenWithCommand(object):
                   "For a literal '\"', use '%\"'."))
 
         if inarg:
-            result.append(buf)
+            result.append(self._expand_argument(parts + [(False, buf)]))
         return result
+
+    @staticmethod
+    def _expand_argument(parts: List[Tuple[bool, str]]) -> str:
+        # Expand the complete template argument so Windows' single-quote
+        # handling still spans substitutions. Environment values cannot contain
+        # NUL, so opaque markers cannot be introduced by expandvars itself.
+        prefix = '\0'
+        while any(prefix in value for _, value in parts):
+            prefix += '\0'
+        literals = []
+        template = []
+        for substituted, value in parts:
+            if substituted:
+                marker = prefix + str(len(literals)) + prefix
+                literals.append((marker, value))
+                template.append(marker)
+            else:
+                template.append(value)
+        argument = os.path.expandvars(''.join(template))
+        for marker, value in literals:
+            argument = argument.replace(marker, value)
+        return argument
 
     def _expand_variable(self, identifier, window, context_type):
         """ Replaces variables with their respective file
         or archive path. """
 
-        if context_type == DEBUGGING_CONTEXT:
-            return '%' + identifier
-
-        if not (context_type & IMAGE_FILE_CONTEXT) and identifier in ('f', 'd', 'b', 's', 'F', 'D', 'B', 'S'):
+        if not (context_type & IMAGE_FILE_CONTEXT) and identifier in 'fdbsFDBS':
             raise OpenWithException(
                 _("File-related variables can only be used for files."))
 
-        if not (context_type & ARCHIVE_CONTEXT) and identifier in ('a', 'c', 'A', 'C'):
+        if not (context_type & ARCHIVE_CONTEXT) and identifier in 'acAC':
             raise OpenWithException(
                 _("Archive-related variables can only be used for archives."))
 
-        if identifier == '/':
-            return os.path.sep
-        elif identifier == 'a':
-            return window.filehandler.get_base_filename()
-        elif identifier == 'd':
-            return os.path.basename(os.path.dirname(window.imagehandler.get_path_to_page()))
-        elif identifier == 'f':
-            return window.imagehandler.get_page_filename()
-        elif identifier == 'c':
-            return os.path.basename(os.path.dirname(window.filehandler.get_path_to_base()))
-        elif identifier == 'b':
-            if (context_type & ARCHIVE_CONTEXT):
-                return window.filehandler.get_base_filename() # same as %a
-            else:
-                return os.path.basename(os.path.dirname(window.imagehandler.get_path_to_page())) # same as %d
-        elif identifier == 's':
-            if (context_type & ARCHIVE_CONTEXT):
-                return os.path.basename(os.path.dirname(window.filehandler.get_path_to_base())) # same as %c
-            else:
-                return os.path.basename(os.path.dirname(os.path.dirname(window.imagehandler.get_path_to_page())))
-        elif identifier == 'A':
-            return window.filehandler.get_path_to_base()
-        elif identifier == 'D':
-            return os.path.normpath(os.path.dirname(window.imagehandler.get_path_to_page()))
-        elif identifier == 'F':
-            return os.path.normpath(window.imagehandler.get_path_to_page())
-        elif identifier == 'C':
-            return os.path.dirname(window.filehandler.get_path_to_base())
-        elif identifier == 'B':
-            if (context_type & ARCHIVE_CONTEXT):
-                return window.filehandler.get_path_to_base() # same as %A
-            else:
-                return os.path.normpath(os.path.dirname(window.imagehandler.get_path_to_page())) # same as %D
-        elif identifier == 'S':
-            if (context_type & ARCHIVE_CONTEXT):
-                return os.path.dirname(window.filehandler.get_path_to_base()) # same as %C
-            else:
-                return os.path.dirname(os.path.dirname(window.imagehandler.get_path_to_page()))
+        # %b, %s, %B and %S name the archive in an archive, else the page's
+        # folder (%s and %S its parent).
+        if context_type & ARCHIVE_CONTEXT:
+            identifier = {'b': 'a', 's': 'c', 'B': 'A', 'S': 'C'}.get(identifier, identifier)
         else:
+            identifier = {'b': 'd', 'B': 'D'}.get(identifier, identifier)
+
+        page = window.imagehandler.get_path_to_page
+        base = window.filehandler.get_path_to_base
+        variables = {
+            '/': lambda: os.path.sep,
+            'a': window.filehandler.get_base_filename,
+            'c': lambda: os.path.basename(os.path.dirname(base())),
+            'A': base,
+            'C': lambda: os.path.dirname(base()),
+            'f': window.imagehandler.get_page_filename,
+            'd': lambda: os.path.basename(os.path.dirname(page())),
+            's': lambda: os.path.basename(os.path.dirname(os.path.dirname(page()))),
+            'F': lambda: os.path.normpath(page()),
+            'D': lambda: os.path.normpath(os.path.dirname(page())),
+            'S': lambda: os.path.dirname(os.path.dirname(page())),
+        }
+        if identifier not in variables:
             raise OpenWithException(
                 _("Invalid escape sequence: %%%s") % identifier)
+        return variables[identifier]()
 
-    def _get_context_type(self, window, check_restrictions=True):
-        if not check_restrictions:
-            return DEBUGGING_CONTEXT # ignore context, reflect variable name
+    def _get_context_type(self, window):
         context = 0
         if not window.filehandler.file_loaded:
             context = NO_FILE_CONTEXT # no file loaded
@@ -306,8 +334,14 @@ class OpenWithEditor(Gtk.Dialog):
         self._window.page_changed += self.test_command
         self._window.filehandler.file_opened += self.test_command
         self._window.filehandler.file_closed += self.test_command
+        self.connect('destroy', self._detach_callbacks)
 
         self.resize(600, 400)
+
+    def _detach_callbacks(self, widget: Gtk.Widget) -> None:
+        self._window.page_changed -= self.test_command
+        self._window.filehandler.file_opened -= self.test_command
+        self._window.filehandler.file_closed -= self.test_command
 
     def save(self):
         """ Serializes the tree model into a list of OpenWithCommands
@@ -330,10 +364,6 @@ class OpenWithEditor(Gtk.Dialog):
 
     def get_command(self):
         """ Retrieves the selected command object. """
-        selection = self._command_tree.get_selection()
-        if not selection:
-            return None
-
         model, iter = self._command_tree.get_selection().get_selected()
         if (iter and model.iter_is_valid(iter)):
             command = OpenWithCommand(*model.get(iter, 0, 1, 2, 3))
@@ -477,7 +507,7 @@ class OpenWithEditor(Gtk.Dialog):
         linklabel = Gtk.Label()
         linklabel.set_markup(_('Please refer to the <a href="%s">external command documentation</a> '
             'for a list of usable variables and other hints.') % \
-                'https://sourceforge.net/p/mcomix/wiki/External_Commands')
+                constants.HOMEPAGE + '/blob/main/docs/user/external-commands.md')
         linklabel.set_alignment(0, 0)
         content.pack_start(linklabel, False, False, 4)
 
@@ -526,7 +556,7 @@ class OpenWithEditor(Gtk.Dialog):
         def delayed_set_value():
             old_value = model.get_value(iter, column)
             model.set_value(iter, column, new_text)
-            self._changed = old_value != new_text
+            self._changed = self._changed or old_value != new_text
             self.test_command()
         GLib.idle_add(delayed_set_value)
 

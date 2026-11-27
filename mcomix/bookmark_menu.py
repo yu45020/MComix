@@ -39,10 +39,20 @@ class BookmarksMenu(Gtk.Menu):
 
         # Re-create the bookmarks menu if one was added/removed
         self._create_bookmark_menuitems()
-        self._bookmarks_store.add_bookmark += lambda bookmark: self._create_bookmark_menuitems()
-        self._bookmarks_store.remove_bookmark += lambda bookmark: self._create_bookmark_menuitems()
+        self._bookmarks_store.add_bookmark += self._bookmarks_updated
+        self._bookmarks_store.remove_bookmark += self._bookmarks_updated
+        self._bookmarks_store.bookmarks_reordered += self._bookmarks_updated
+        self.connect('destroy', self._destroy)
 
         self.show_all()
+
+    def _bookmarks_updated(self, *args) -> None:
+        self._create_bookmark_menuitems()
+
+    def _destroy(self, *args) -> None:
+        self._bookmarks_store.add_bookmark -= self._bookmarks_updated
+        self._bookmarks_store.remove_bookmark -= self._bookmarks_updated
+        self._bookmarks_store.bookmarks_reordered -= self._bookmarks_updated
 
     def _create_bookmark_menuitems(self):
         # Delete all old menu entries

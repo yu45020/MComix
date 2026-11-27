@@ -52,11 +52,6 @@ class MobiArchive(archive_base.NonUnicodeArchive):
             f.close()
             raise
 
-    def _close(self):
-        if self.file is not None:
-            self.file.close()
-            self.file = None
-
     def iter_contents(self):
         ''' List archive contents. '''
         supported_mimes={}
@@ -81,8 +76,9 @@ class MobiArchive(archive_base.NonUnicodeArchive):
             data = self.sect.loadSection(i)
             with self._create_file(destination_path) as new:
                 new.write(data)
-        return destination_path
 
     def close(self):
         ''' Close the archive handle '''
-        self._close()
+        if self.file is not None:
+            self.file.close()
+            self.file = None

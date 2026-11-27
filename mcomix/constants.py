@@ -3,12 +3,12 @@
 
 import enum
 import os
-import sys
 
 from mcomix import tools
 
 APPNAME = 'MComix'
 VERSION = '3.2.1-dev0'
+HOMEPAGE = 'https://github.com/yu45020/mcomix'
 
 HOME_DIR = tools.get_home_directory()
 CONFIG_DIR = tools.get_config_directory()
@@ -17,15 +17,12 @@ DATA_DIR = tools.get_data_directory()
 BASE_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 THUMBNAIL_PATH = tools.get_thumbnail_directory()
 LIBRARY_DATABASE_PATH = os.path.join(DATA_DIR, 'library.db')
-LASTPAGE_DATABASE_PATH = os.path.join(DATA_DIR, 'lastreadpage.db')
 LIBRARY_COVERS_PATH = os.path.join(DATA_DIR, 'library_covers')
 PREFERENCE_PATH = os.path.join(CONFIG_DIR, 'preferences.conf')
 KEYBINDINGS_CONF_PATH = os.path.join(CONFIG_DIR, 'keybindings.conf')
 
 BOOKMARK_PICKLE_PATH = os.path.join(DATA_DIR, 'bookmarks.pickle')
 FILEINFO_PICKLE_PATH = os.path.join(DATA_DIR, 'file.pickle')
-# Transitional - used if json preferences are (were) absent.
-PREFERENCE_PICKLE_PATH = os.path.join(CONFIG_DIR, 'preferences.pickle')
 
 
 class ZoomMode(enum.IntEnum):
@@ -59,7 +56,7 @@ UNION_INDEX = -2
 ANIMATION_DISABLED, ANIMATION_NORMAL = list(range(2))
 
 ZIP, RAR, TAR, GZIP, BZIP2, XZ, PDF, SEVENZIP, LHA, ZIP_EXTERNAL, MOBI = list(range(11))
-NORMAL_CURSOR, GRAB_CURSOR, WAIT_CURSOR, NO_CURSOR = list(range(4))
+NORMAL_CURSOR, GRAB_CURSOR, NO_CURSOR = list(range(3))
 LIBRARY_DRAG_EXTERNAL_ID, LIBRARY_DRAG_BOOK_ID, LIBRARY_DRAG_COLLECTION_ID = list(range(3))
 AUTOROTATE_NEVER, AUTOROTATE_WIDTH_90, AUTOROTATE_WIDTH_270, \
     AUTOROTATE_HEIGHT_90, AUTOROTATE_HEIGHT_270 = list(range(5))
@@ -68,8 +65,6 @@ RESPONSE_REVERT_TO_DEFAULT = 3
 RESPONSE_REMOVE = 4
 RESPONSE_IMPORT = 5
 RESPONSE_SAVE_AS = 6
-RESPONSE_REPLACE = 7
-RESPONSE_NEW = 8
 
 # These are bit field values, so only use powers of two.
 STATUS_PAGE, STATUS_RESOLUTION, STATUS_PATH, STATUS_FILENAME, STATUS_FILENUMBER, STATUS_FILESIZE = \
@@ -92,10 +87,10 @@ RAR_FORMATS = (
         ('rar', 'cbr'))
 TAR_FORMATS = (
         ('application/x-tar', 'application/x-gzip', 'application/x-bzip2', 'application/x-cbt'),
-        ('tar', 'gz', 'bz2', 'bzip2', 'cbt'))
+        ('tar', 'gz', 'bz2', 'bzip2', 'xz', 'lzma', 'cbt'))
 SZIP_FORMATS = (
         ('application/x-7z-compressed', 'application/x-cb7'),
-        ('7z', 'cb7', 'xz', 'lzma'))
+        ('7z', 'cb7'))
 LHA_FORMATS = (
         ('application/x-lzh', 'application/x-lha', 'application/x-lzh-compressed'),
         ('lha', 'lzh'))

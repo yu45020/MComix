@@ -1,20 +1,18 @@
-import unittest
+import pytest
 
 from mcomix import tools
 
 
-class TestAlphanumericSort(unittest.TestCase):
-    def test_numbers_are_ordered_naturally(self) -> None:
-        lst = ['10.jpg', '2.jpg']
-        tools.alphanumeric_sort(lst)
-        self.assertListEqual(lst, ['2.jpg', '10.jpg'])
-
-    def test_sort_with_mixed_number_and_string_files(self) -> None:
-        lst = ['text_2.jpg', '2_text.jpg']
-        tools.alphanumeric_sort(lst)
-        self.assertListEqual(lst, ['2_text.jpg', 'text_2.jpg'])
-
-    def test_sort_creates_strict_order(self) -> None:
-        lst = ['Comic 001-01.jpg', 'Comic 001-00.jpg', 'zCover.jpg', 'Comic 001-03.jpg']
-        tools.alphanumeric_sort(lst)
-        self.assertListEqual(lst, ['Comic 001-00.jpg', 'Comic 001-01.jpg', 'Comic 001-03.jpg', 'zCover.jpg'])
+@pytest.mark.parametrize('files,expected', [
+    (['text_2.jpg', '2_text.jpg'], ['2_text.jpg', 'text_2.jpg']),
+    (['Comic 001-01.jpg', 'Comic 001-00.jpg', 'zCover.jpg', 'Comic 001-03.jpg'],
+     ['Comic 001-00.jpg', 'Comic 001-01.jpg', 'Comic 001-03.jpg', 'zCover.jpg']),
+    # Superscript digits are text; other decimal digits are numbers.
+    (['Vol 10', 'Vol 2', 'Vol 1²', 'Vol 1'], ['Vol 1', 'Vol 1²', 'Vol 2', 'Vol 10']),
+    # Equal keys keep their order.
+    (['Vol 10', 'Vol ٢', 'vol 02', 'Vol 2', 'Vol ١'],
+     ['Vol ١', 'Vol ٢', 'vol 02', 'Vol 2', 'Vol 10']),
+])
+def test_alphanumeric_sort(files: list, expected: list) -> None:
+    tools.alphanumeric_sort(files)
+    assert files == expected

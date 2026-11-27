@@ -3,7 +3,9 @@
 """preferences_dialog.py - Preferences dialog."""
 
 import operator
-from gi.repository import Gdk, GdkPixbuf, Gtk, GObject
+import os
+import threading
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, GObject
 
 from mcomix.preferences import prefs
 from mcomix import preferences_page
@@ -12,6 +14,7 @@ from mcomix import constants
 from mcomix import message_dialog
 from mcomix import keybindings
 from mcomix import keybindings_editor
+from mcomix import upscale
 from mcomix.i18n import _
 
 _dialog = None
@@ -73,7 +76,7 @@ class _PreferencesDialog(Gtk.Dialog):
         # ----------------------------------------------------------------
         # The "Appearance" tab.
         # ----------------------------------------------------------------
-        page = preferences_page._PreferencePage(None)
+        page = preferences_page._PreferencePage()
 
         page.new_section(_('User interface'))
 
@@ -135,7 +138,7 @@ class _PreferencesDialog(Gtk.Dialog):
         # ----------------------------------------------------------------
         # The "Behaviour" tab.
         # ----------------------------------------------------------------
-        page = preferences_page._PreferencePage(None)
+        page = preferences_page._PreferencePage()
 
         page.new_section(_('Scroll'))
 
@@ -220,8 +223,10 @@ class _PreferencesDialog(Gtk.Dialog):
         page.add_row(Gtk.Label(label=_('Store information about recently opened files:')),
             self._create_store_recent_combobox())
 
-        page.add_row(self._create_pref_check_button(_('Save As opens at the last directory saved into'),
-            'store last saved in directory', 'Open the Save As dialog at the directory in which the last file was saved.'))
+        page.add_row(self._create_pref_check_button(
+            _('Save As opens at the last directory saved into'),
+            'store last saved in directory',
+            _('Open the Save As dialog at the directory in which the last file was saved.')))
 
         return page
 
@@ -229,7 +234,7 @@ class _PreferencesDialog(Gtk.Dialog):
         # ----------------------------------------------------------------
         # The "Display" tab.
         # ----------------------------------------------------------------
-        page = preferences_page._PreferencePage(None)
+        page = preferences_page._PreferencePage()
 
         page.new_section(_('Fullscreen'))
 
@@ -287,14 +292,168 @@ class _PreferencesDialog(Gtk.Dialog):
         page.add_row(Gtk.Label(label=_('Scaling mode')),
             self._create_scaling_quality_combobox())
 
+        upscale_widgets = [self._create_pref_check_button(
+            _('Neural upscaling for small pages'),
+            'neural upscaling',
+            _('Enlarge small pages with a neural network (ONNX model, needs a DirectX 12 GPU and onnxruntime-windowsml).'))]
+        page.add_row(upscale_widgets[-1])
+
+        upscale_widgets += [Gtk.Label(label=_('Upscaling model:')),
+                            self._create_upscale_model_chooser()]
+        page.add_row(*upscale_widgets[-2:])
+
+        model_help = Gtk.Label(label=_(
+            'The network that enlarges pages. Keep the bundled default '
+            '(SPAN-F-YC, 2x) unless you converted another model with '
+            'tools/export_onnx.py. Prefer ".fp16.onnx" files: they are '
+            'much faster.'))
+        model_help.set_line_wrap(True)
+        model_help.set_max_width_chars(60)
+        model_help.get_style_context().add_class('dim-label')
+        page.add_row(model_help)
+
+        upscale_widgets += [Gtk.Label(label=_('Only upscale pages smaller than (pixels):')),
+                            self._create_pref_spinner('neural upscaling max input size',
+                            1, 64, 8192, 64, 256, 0, None)]
+        page.add_row(*upscale_widgets[-2:])
+
+        upscale_widgets.append(self._create_pref_check_button(
+            _('Upscale pages even when they are not enlarged'),
+            'neural upscaling always', None))
+        page.add_row(upscale_widgets[-1])
+
+        upscale_widgets += [Gtk.Label(label=_('GPU runtime:')),
+                            self._create_combobox(
+                                ((_('Automatic (fastest available)'), upscale.RUNTIME_AUTO),
+                                 (_('DirectML'), upscale.RUNTIME_DIRECTML)),
+                                'neural upscaling runtime')]
+        upscale_widgets[-1].set_tooltip_text(_(
+            'Automatic uses a faster runtime from Windows ML (e.g. NVIDIA '
+            'TensorRT-RTX) when Windows has installed one for your GPU, and '
+            'DirectML otherwise.'))
+        page.add_row(*upscale_widgets[-2:])
+        page.add_row(self._create_upscale_runtime_status())
+
+        if not upscale.gpu_available():
+            # Neural upscaling never runs on the CPU.
+            for widget in upscale_widgets:
+                widget.set_sensitive(False)
+            model_help.set_text(_(
+                'Neural upscaling is unavailable: it needs a DirectX 12 GPU '
+                'and the onnxruntime-windowsml package.'))
+
         return page
+
+    def _create_upscale_model_chooser(self):
+        chooser = Gtk.FileChooserButton(title=_('Select upscaling model'),
+                                        action=Gtk.FileChooserAction.OPEN)
+        file_filter = Gtk.FileFilter()
+        file_filter.set_name(_('ONNX models'))
+        file_filter.add_pattern('*.onnx')
+        chooser.add_filter(file_filter)
+        chooser.set_tooltip_text(_('An ONNX super-resolution model made with tools/export_onnx.py.'))
+        if upscale.model_path():
+            chooser.set_filename(upscale.model_path())
+        chooser.connect('file-set', self._upscale_model_cb)
+
+        default_button = Gtk.Button(label=_('Default'))
+        default_button.set_tooltip_text(_('Use the bundled model (SPAN-F-YC, 2x).'))
+        default_button.set_sensitive(os.path.isfile(upscale.DEFAULT_MODEL))
+        default_button.connect('clicked', self._upscale_model_default_cb, chooser)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.pack_start(chooser, True, True, 0)
+        box.pack_start(default_button, False, False, 0)
+        return box
+
+    def _upscale_model_cb(self, chooser):
+        filename = chooser.get_filename() or ''
+        # Store '' for the default model, so it follows MComix updates.
+        if os.path.normcase(filename) == os.path.normcase(upscale.DEFAULT_MODEL):
+            filename = ''
+        prefs['neural upscaling model'] = filename
+        self._window.imagehandler.upscaler.configure()
+        self._window.draw_image()
+
+    def _create_upscale_runtime_status(self):
+        """ Returns a row telling which GPU runtime upscaling uses, with a
+        button to install a faster one when Windows offers it. """
+        status = Gtk.Label()
+        status.set_line_wrap(True)
+        status.set_max_width_chars(60)
+        status.set_xalign(0)
+        status.get_style_context().add_class('dim-label')
+        install = Gtk.Button()
+        install.set_no_show_all(True)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.pack_start(status, True, True, 0)
+        box.pack_start(install, False, False, 0)
+
+        in_use = self._window.imagehandler.upscaler.runtime_label
+        status.set_text(_('In use: %s') % in_use if in_use else '')
+
+        def show(installed, installable):
+            from mcomix.upscale_backends import windows_ml
+            text = [status.get_text()] if in_use else []
+            if installed and windows_ml.label(installed) != in_use:
+                text.append(_('Available: %s') % windows_ml.label(installed))
+            elif installable:
+                text.append(_('Windows can install %s for this GPU.')
+                            % windows_ml.label(installable))
+                install.set_label(_('Install'))
+                install.set_tooltip_text(_('Download and install %s from Microsoft '
+                                           '(may take a few minutes).')
+                                         % windows_ml.label(installable))
+                install.show()
+            status.set_text('  '.join(text))
+            return False
+
+        def query():
+            from mcomix.upscale_backends import windows_ml
+            installed = windows_ml.installed_provider()
+            installable = None if installed else windows_ml.installable_provider()
+            GLib.idle_add(show, installed, installable)
+
+        def do_install(button):
+            from mcomix.upscale_backends import windows_ml
+            name = windows_ml.installable_provider()
+            if name is None:
+                return
+            button.set_sensitive(False)
+            status.set_text(_('Installing %s...') % windows_ml.label(name))
+
+            def run():
+                try:
+                    windows_ml.install(name)
+                    message = _('%s is installed.') % windows_ml.label(name)
+                except Exception as e:
+                    message = _('Could not install %(name)s: %(error)s') % {
+                        'name': windows_ml.label(name), 'error': e}
+
+                def done():
+                    status.set_text(message)
+                    button.hide()
+                    self._window.imagehandler.upscaler.configure()
+                    return False
+                GLib.idle_add(done)
+            threading.Thread(target=run, name='upscale-install', daemon=True).start()
+
+        install.connect('clicked', do_install)
+        threading.Thread(target=query, name='upscale-runtime-query', daemon=True).start()
+        return box
+
+    def _upscale_model_default_cb(self, button, chooser):
+        chooser.set_filename(upscale.DEFAULT_MODEL)
+        prefs['neural upscaling model'] = ''
+        self._window.imagehandler.upscaler.configure()
+        self._window.draw_image()
 
     def _init_advanced_tab(self):
         # ----------------------------------------------------------------
         # The "Advanced" tab.
         # ----------------------------------------------------------------
 
-        page = preferences_page._PreferencePage(None)
+        page = preferences_page._PreferencePage()
 
         page.new_section(_('File order'))
 
@@ -305,6 +464,11 @@ class _PreferencesDialog(Gtk.Dialog):
             self._create_archive_sort_by_control())
 
         page.new_section(_('Extraction and cache'))
+
+        page.add_row(self._create_pref_check_button(
+            _('Read archive pages on demand'),
+            'lazy archive reading',
+            _('Read pages directly from archives that allow it (e.g. ZIP/CBZ, non-solid RAR/CBR), instead of extracting the whole archive to a temporary folder. Takes effect for the next opened archive.')))
 
         page.add_row(Gtk.Label(label=_('Maximum number of concurrent extraction threads:')),
             self._create_pref_spinner('max extract threads',
@@ -342,6 +506,32 @@ class _PreferencesDialog(Gtk.Dialog):
 
         page.add_row(Gtk.Label(_('Animation mode:')),
             self._create_animation_mode_combobox())
+
+        page.add_row(self._create_pref_check_button(
+            _('Enlarge animated WebP images'), 'enlarge animated webp',
+            _('Allow animated WebP pages to grow beyond their original dimensions. '
+              'Turn this off to reduce animation memory use; shrinking to fit still works.')))
+        page.add_row(
+            Gtk.Label(label=_('Maximum animated WebP display size (pixels):')),
+            self._create_pref_spinner(
+                'animated webp max size', 1, 0, 16384, 256, 1024, 0,
+                _('Limit the longest display edge, preserving aspect ratio. '
+                  'Larger native images are also reduced. Use 0 for unlimited.')))
+        page.add_row(
+            Gtk.Label(label=_('Animation cache limit (MiB):')),
+            self._create_pref_spinner(
+                'animation cache limit', 1, 8, 1024, 8, 32, 0,
+                _('Memory shared across visible WebP animations. Decoder memory and '
+                  'compressed file data use additional memory.')))
+        animation_help = Gtk.Label(label=_(
+            'Example: a decoded 600 × 900 frame uses about 2.1 MiB; four frames '
+            'use 8.2 MiB, plus resized output buffers. A 2000 × 1333 output buffer '
+            'alone uses about 10.2 MiB. The compressed WebP file size does not '
+            'indicate playback memory use.'))
+        animation_help.set_line_wrap(True)
+        animation_help.set_max_width_chars(60)
+        animation_help.get_style_context().add_class('dim-label')
+        page.add_row(animation_help)
 
         return page
 
@@ -421,18 +611,7 @@ class _PreferencesDialog(Gtk.Dialog):
             ('正體中文', 'zh_TW')]  # Chinese (traditional)
         languages.sort(key=operator.itemgetter(0))
 
-        box = self._create_combobox(languages, prefs['language'],
-                self._language_changed_cb)
-
-        return box
-
-    def _language_changed_cb(self, combobox, *args):
-        """ Called whenever the language was changed. """
-        model_index = combobox.get_active()
-        if model_index > -1:
-            iter = combobox.get_model().iter_nth_child(None, model_index)
-            text, lang_code = combobox.get_model().get(iter, 0, 1)
-            prefs['language'] = lang_code
+        return self._create_combobox(languages, 'language')
 
     def _create_doublepage_as_one_control(self):
         """ Creates the ComboBox control for selecting virtual double page options. """
@@ -442,23 +621,13 @@ class _PreferencesDialog(Gtk.Dialog):
                 (_('Only for wide images'), constants.SHOW_DOUBLE_AS_ONE_WIDE),
                 (_('Always'), constants.SHOW_DOUBLE_AS_ONE_TITLE | constants.SHOW_DOUBLE_AS_ONE_WIDE))
 
-        box = self._create_combobox(items,
-                prefs['virtual double page for fitting images'],
-                self._double_page_changed_cb)
+        box = self._create_combobox(items, 'virtual double page for fitting images')
 
         box.set_tooltip_text(
             _("When showing the first page of an archive, or an image's width "
               "exceeds its height, only a single page will be displayed."))
 
         return box
-
-    def _double_page_changed_cb(self, combobox, *args):
-        """ Called when a new option was selected for the virtual double page option. """
-        iter = combobox.get_active_iter()
-        if combobox.get_model().iter_is_valid(iter):
-            value = combobox.get_model().get_value(iter, 1)
-            prefs['virtual double page for fitting images'] = value
-            self._window.draw_image()
 
     def _create_double_page_autoresize_control(self):
         """ Creates the ComboBox control for selecting double page autoresize options. """
@@ -467,22 +636,12 @@ class _PreferencesDialog(Gtk.Dialog):
                 (_('Prefer same size'), constants.DOUBLE_PAGE_AUTORESIZE_SIZE),
                 (_('Fit to same size'), constants.DOUBLE_PAGE_AUTORESIZE_FIT_SIZE))
 
-        box = self._create_combobox(items,
-                prefs['double page autoresize'],
-                self._double_page_autoresize_changed_cb)
+        box = self._create_combobox(items, 'double page autoresize')
 
         box.set_tooltip_text(
             _("Maintain relative size or fit to same size."))
 
         return box
-
-    def _double_page_autoresize_changed_cb(self, combobox, *args):
-        """ Called when a new option was selected for the double page autoresize option. """
-        iter = combobox.get_active_iter()
-        if combobox.get_model().iter_is_valid(iter):
-            value = combobox.get_model().get_value(iter, 1)
-            prefs['double page autoresize'] = value
-            self._window.draw_image()
 
     def _create_sort_by_control(self):
         """ Creates the ComboBox control for selecting file sort by options. """
@@ -493,16 +652,13 @@ class _PreferencesDialog(Gtk.Dialog):
                 (_('File size'), constants.SORT_SIZE),
                 (_('Last modified'), constants.SORT_LAST_MODIFIED))
 
-        sortkey_box = self._create_combobox(sortkey_items, prefs['sort by'],
-            self._sort_by_changed_cb)
+        sortkey_box = self._create_combobox(sortkey_items, 'sort by')
 
         sortorder_items = (
                 (_('Ascending'), constants.SORT_ASCENDING),
                 (_('Descending'), constants.SORT_DESCENDING))
 
-        sortorder_box = self._create_combobox(sortorder_items,
-                prefs['sort order'],
-                self._sort_order_changed_cb)
+        sortorder_box = self._create_combobox(sortorder_items, 'sort order')
 
         box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 0)
         box.pack_start(sortkey_box, True, True, 0)
@@ -515,24 +671,6 @@ class _PreferencesDialog(Gtk.Dialog):
 
         return box
 
-    def _sort_by_changed_cb(self, combobox, *args):
-        """ Called when a new option was selected for the virtual double page option. """
-        iter = combobox.get_active_iter()
-        if combobox.get_model().iter_is_valid(iter):
-            value = combobox.get_model().get_value(iter, 1)
-            prefs['sort by'] = value
-
-            self._window.filehandler.refresh_file()
-
-    def _sort_order_changed_cb(self, combobox, *args):
-        """ Called when sort order changes (ascending or descending) """
-        iter = combobox.get_active_iter()
-        if combobox.get_model().iter_is_valid(iter):
-            value = combobox.get_model().get_value(iter, 1)
-            prefs['sort order'] = value
-
-            self._window.filehandler.refresh_file()
-
     def _create_archive_sort_by_control(self):
         """ Creates the ComboBox control for selecting archive sort by options. """
         sortkey_items = (
@@ -541,16 +679,13 @@ class _PreferencesDialog(Gtk.Dialog):
                 (_('Literal order'), constants.SORT_NAME_LITERAL),
                 (_('GLib order'), constants.SORT_NAME_GLIB))
 
-        sortkey_box = self._create_combobox(sortkey_items, prefs['sort archive by'],
-            self._sort_archive_by_changed_cb)
+        sortkey_box = self._create_combobox(sortkey_items, 'sort archive by')
 
         sortorder_items = (
                 (_('Ascending'), constants.SORT_ASCENDING),
                 (_('Descending'), constants.SORT_DESCENDING))
 
-        sortorder_box = self._create_combobox(sortorder_items,
-                prefs['sort archive order'],
-                self._sort_archive_order_changed_cb)
+        sortorder_box = self._create_combobox(sortorder_items, 'sort archive order')
 
         box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 0)
         box.pack_start(sortkey_box, True, True, 0)
@@ -567,52 +702,19 @@ class _PreferencesDialog(Gtk.Dialog):
 
         return box
 
-    def _sort_archive_by_changed_cb(self, combobox, *args):
-        """ Called when a new option was selected for the virtual double page option. """
-        iter = combobox.get_active_iter()
-        if combobox.get_model().iter_is_valid(iter):
-            value = combobox.get_model().get_value(iter, 1)
-            prefs['sort archive by'] = value
-
-            self._window.filehandler.refresh_file()
-
-    def _sort_archive_order_changed_cb(self, combobox, *args):
-        """ Called when sort order changes (ascending or descending) """
-        iter = combobox.get_active_iter()
-        if combobox.get_model().iter_is_valid(iter):
-            value = combobox.get_model().get_value(iter, 1)
-            prefs['sort archive order'] = value
-
-            self._window.filehandler.refresh_file()
-
     def _create_store_recent_combobox(self):
         """ Creates the combobox for "Store recently opened files". """
         items = (
                 (_('Never'), False),
                 (_('Always'), True))
 
-        # Map legacy 0/1/2 values:
-        if prefs['store recent file info'] == 0:
-            selection = False
-        elif prefs['store recent file info'] in (1, 2):
-            selection = True
-        else:
-            selection = prefs['store recent file info']
-
-        box = self._create_combobox(items, selection, self._store_recent_changed_cb)
+        box = self._create_combobox(items, 'store recent file info')
         box.set_tooltip_text(
             _('Add information about all files opened from within MComix to the shared recent files list.'))
         return box
 
-    def _store_recent_changed_cb(self, combobox, *args):
+    def _store_recent_changed(self, last_value, value):
         """ Called when option "Store recently opened files" was changed. """
-        iter = combobox.get_active_iter()
-        if not combobox.get_model().iter_is_valid(iter):
-            return
-
-        value = combobox.get_model().get_value(iter, 1)
-        last_value = prefs['store recent file info']
-        prefs['store recent file info'] = value
         self._window.filehandler.last_read_page.set_enabled(value)
 
         # If "Never" was selected, ask to purge recent files.
@@ -638,26 +740,15 @@ class _PreferencesDialog(Gtk.Dialog):
         items = (
                 (_('Normal (fast)'), int(GdkPixbuf.InterpType.TILES)),
                 (_('Bilinear'), int(GdkPixbuf.InterpType.BILINEAR)),
-                (_('Hyperbolic (slow)'), int(GdkPixbuf.InterpType.HYPER)))
+                (_('Lanczos (sharp)'), image_tools.SCALING_LANCZOS))
 
-        selection = prefs['scaling quality']
-
-        box = self._create_combobox(items, selection, self._scaling_quality_changed_cb)
+        box = self._create_combobox(items, 'scaling quality')
         box.set_tooltip_text(
-            _('Changes how images are scaled. Slower algorithms result in higher quality resizing, but longer page loading times.'))
+            _('Changes how pages are scaled. Lanczos is the sharpest and smooths '
+              'fine patterns best when shrinking pages, but takes a few more '
+              'milliseconds per page; the magnifier and thumbnails use bilinear with it.'))
 
         return box
-
-    def _scaling_quality_changed_cb(self, combobox, *args):
-        """ Called whan image scaling quality changes. """
-        iter = combobox.get_active_iter()
-        if combobox.get_model().iter_is_valid(iter):
-            value = combobox.get_model().get_value(iter, 1)
-            last_value = prefs['scaling quality']
-            prefs['scaling quality'] = value
-
-            if value != last_value:
-                self._window.draw_image()
 
     def _create_animation_mode_combobox(self):
         """ Creates combo box for animation mode """
@@ -665,34 +756,18 @@ class _PreferencesDialog(Gtk.Dialog):
                 (_('Never'), constants.ANIMATION_DISABLED),
                 (_('Normal'), constants.ANIMATION_NORMAL))
 
-        selection = prefs['animation mode']
-
-        box = self._create_combobox(items, selection, self._animation_mode_changed_cb)
+        box = self._create_combobox(items, 'animation mode')
         box.set_tooltip_text(
             _('Controls how animated images should be displayed.'))
 
         return box
 
-    def _animation_mode_changed_cb(self, combobox, *args):
-        """ Called whenever animation mode has been changed. """
-        iter = combobox.get_active_iter()
-        if combobox.get_model().iter_is_valid(iter):
-            value = combobox.get_model().get_value(iter, 1)
-            last_value = prefs['animation mode']
-            prefs['animation mode'] = value
-
-            if value != last_value:
-                self._window.filehandler.refresh_file()
-
-    def _create_combobox(self, options, selected_value, change_callback):
-        """ Creates a new dropdown combobox and populates it with the items
-        passed in C{options}.
+    def _create_combobox(self, options, preference):
+        """ Creates a new dropdown combobox for <preference> and populates it
+        with the items passed in C{options}. The item holding the current
+        value is pre-selected.
 
         @param options: List of tuples: (Option display text, option value)
-        @param selected_value: One of the values passed in C{options} that will
-            be pre-selected when the control is created.
-        @param change_callback: Function that will be called when the 'changed'
-            event is triggered.
         @returns Gtk.ComboBox
         """
         assert options and len(options[0]) == 2, "Invalid format for options."
@@ -711,16 +786,46 @@ class _PreferencesDialog(Gtk.Dialog):
         # Set active box option
         iter = model.get_iter_first()
         while iter:
-            if model.get_value(iter, 1) == selected_value:
+            if model.get_value(iter, 1) == prefs[preference]:
                 box.set_active_iter(iter)
                 break
             else:
                 iter = model.iter_next(iter)
 
-        if change_callback:
-            box.connect('changed', change_callback)
+        box.connect('changed', self._combobox_cb, preference)
 
         return box
+
+    def _combobox_cb(self, combobox, preference):
+        """Callback for all combobox-type preferences."""
+        iter = combobox.get_active_iter()
+        if not combobox.get_model().iter_is_valid(iter):
+            return
+        value = combobox.get_model().get_value(iter, 1)
+        last_value = prefs[preference]
+        prefs[preference] = value
+
+        if (preference in ('scaling quality', 'animation mode', 'neural upscaling runtime')
+                and value == last_value):
+            return
+
+        if preference == 'virtual double page for fitting images':
+            self._window.imagehandler.do_cacheing()
+            self._window.draw_image()
+
+        elif preference in ('double page autoresize', 'scaling quality'):
+            self._window.draw_image()
+
+        elif preference in ('sort by', 'sort order', 'sort archive by',
+                            'sort archive order', 'animation mode'):
+            self._window.filehandler.refresh_file()
+
+        elif preference == 'store recent file info':
+            self._store_recent_changed(last_value, value)
+
+        elif preference == 'neural upscaling runtime':
+            self._window.imagehandler.upscaler.configure()
+            self._window.draw_image()
 
 
     def _create_extensions_entry(self):
@@ -775,44 +880,32 @@ class _PreferencesDialog(Gtk.Dialog):
                 self._window.set_bg_colour(prefs['bg colour'])
 
         elif preference == 'smart bg' and button.get_active():
-
-            # if the color is no longer using the smart background then return it to the chosen color
-            if not prefs[preference]:
-                self._window.set_bg_colour(prefs['bg colour'])
-            else:
-                # draw_image() will set the main background to the smart background
-                self._window.draw_image()
+            # draw_image() will set the main background to the smart background
+            self._window.draw_image()
 
         elif preference == 'color box thumb bg' and button.get_active():
-
-            if prefs[preference]:
-                prefs['smart thumb bg'] = False
-                prefs['thumbnail bg uses main colour'] = False
-
-                self._window.thumbnailsidebar.change_thumbnail_background_color(prefs['thumb bg colour'])
-            else:
-                self._window.draw_image()
+            prefs['smart thumb bg'] = False
+            self._window.thumbnailsidebar.change_thumbnail_background_color(prefs['thumb bg colour'])
 
         elif preference == 'smart thumb bg' and button.get_active():
-
-            if prefs[preference]:
-                prefs['color box thumb bg'] = False
-                prefs['thumbnail bg uses main colour'] = False
-
-                if self._window.imagehandler.page_is_available():
-                    pixbuf_count = 2 if self._window.displayed_double() else 1 # XXX limited to at most 2 pages
-                    bg_colour = self._window.imagehandler.get_pixbuf_auto_background(pixbuf_count)
-                    self._window.thumbnailsidebar.change_thumbnail_background_color(bg_colour)
-
-            else:
-                self._window.draw_image()
+            prefs['color box thumb bg'] = False
+            if self._window.imagehandler.page_is_available():
+                pixbuf_count = 2 if self._window.displayed_double() else 1 # XXX limited to at most 2 pages
+                bg_colour = self._window.imagehandler.get_pixbuf_auto_background(pixbuf_count)
+                self._window.thumbnailsidebar.change_thumbnail_background_color(bg_colour)
 
         elif preference in ('checkered bg for transparent images',
-          'no double page for wide images', 'auto rotate from exif'):
+                            'auto rotate from exif', 'enlarge animated webp'):
+            if preference == 'auto rotate from exif':
+                self._window.imagehandler.do_cacheing()
             self._window.draw_image()
 
         elif (preference == 'hide all in fullscreen' and
             self._window.is_fullscreen):
+            self._window.draw_image()
+
+        elif preference in ('neural upscaling', 'neural upscaling always'):
+            self._window.imagehandler.upscaler.configure()
             self._window.draw_image()
 
         elif preference == 'show page numbers on thumbnails':
@@ -856,52 +949,41 @@ class _PreferencesDialog(Gtk.Dialog):
         """Callback for spinner-type preferences."""
         value = spinbutton.get_value()
 
-        if preference == 'lens size':
-            prefs[preference] = int(value)
-
-        elif preference == 'lens magnification':
+        if preference == 'lens magnification':
             prefs[preference] = value
-
         elif preference == 'slideshow delay':
             prefs[preference] = int(round(value * 1000))
-            self._window.slideshow.update_delay()
-
-        elif preference == 'number of pixels to scroll per slideshow event':
-            prefs[preference] = int(value)
-
-        elif preference == 'number of pixels to scroll per key event':
-            prefs[preference] = int(value)
-
-        elif preference == 'number of pixels to scroll per mouse wheel event':
-            prefs[preference] = int(value)
-
         elif preference == 'smart scroll percentage':
             prefs[preference] = value / 100.0
+        else:
+            prefs[preference] = int(value)
+
+        if preference == 'slideshow delay':
+            self._window.slideshow.update_delay()
 
         elif preference == 'thumbnail size':
-            prefs[preference] = int(value)
             self._window.thumbnailsidebar.resize()
             self._window.draw_image()
 
         elif preference == 'max pages to cache':
-            prefs[preference] = int(value)
             self._window.imagehandler.do_cacheing()
 
+        elif preference in ('animation cache limit', 'animated webp max size'):
+            self._window.draw_image()
+
         elif preference == 'number of key presses before page turn':
-            prefs['number of key presses before page turn'] = int(value)
             self._window._event_handler._extra_scroll_events = 0
 
         elif preference in ('fit to size width wide', 'fit to size height wide',
             'fit to size width other', 'fit to size height other',):
-            prefs[preference] = int(value)
             self._window.change_zoom_mode()
 
-        elif preference == 'max extract threads':
-            prefs[preference] = int(value)
-
         elif preference == 'space between two pages':
-            prefs[preference] = int(value)
             self._window.update_space()
+
+        elif preference == 'neural upscaling max input size':
+            self._window.imagehandler.upscaler.configure()
+            self._window.draw_image()
 
 
     def _entry_cb(self, entry, event=None):

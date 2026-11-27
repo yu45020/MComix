@@ -10,16 +10,12 @@ from mcomix import image_tools
 from mcomix import constants
 from mcomix import log
 from mcomix.archive import (
-    lha_external,
     mobi,
     pdf_multi,
     pdf_external,
-    rar,
-    rar_external,
     sevenzip_external,
     tar,
     zip,
-    zip_external,
 )
 from mcomix import tools
 from mcomix.i18n import _
@@ -29,10 +25,8 @@ _HANDLERS = {
     constants.ZIP: (
         zip.ZipArchive,
     ),
-    # Prefer 7z over zip executable for encryption and Unicode support.
     constants.ZIP_EXTERNAL: (
         sevenzip_external.SevenZipArchive,
-        zip_external.ZipArchive
     ),
     constants.TAR: (
         tar.TarArchive,
@@ -44,19 +38,13 @@ _HANDLERS = {
         tar.TarArchive,
     ),
     constants.XZ: (
-        # No LZMA support in Python 2 tarfile module.
-        sevenzip_external.TarArchive,
+        tar.TarArchive,
     ),
     constants.RAR: (
-        rar.RarArchive,
-        rar_external.RarArchive,
-        # Last resort: some versions of 7z support RAR.
         sevenzip_external.SevenZipArchive,
     ),
-    # Prefer 7z over lha executable for Unicode support.
     constants.LHA: (
         sevenzip_external.SevenZipArchive,
-        lha_external.LhaArchive,
     ),
     constants.SEVENZIP: (
         sevenzip_external.SevenZipArchive,
@@ -80,44 +68,23 @@ def _get_handler(archive_type):
             return handler
         log.debug("Ignoring unavailable handler %s", handler.__name__)
 
-def _is_available(archive_type):
-    """ Return True if a handler supporting the <archive_type> format is available """
-    return _get_handler(archive_type) is not None
-
-def szip_available():
-    return _is_available(constants.SEVENZIP)
-
-def rar_available():
-    return _is_available(constants.RAR)
-
-def lha_available():
-    return _is_available(constants.LHA)
-
-def pdf_available():
-    return _is_available(constants.PDF)
-
-def mobi_available():
-    return _is_available(constants.MOBI)
+_SUPPORTED_ARCHIVE_FORMATS = {
+    name: (set(formats[0]), set(formats[1]))
+    for name, formats, archive_type in (
+        ('ZIP', constants.ZIP_FORMATS, constants.ZIP),
+        ('Tar', constants.TAR_FORMATS, constants.TAR),
+        ('RAR', constants.RAR_FORMATS, constants.RAR),
+        ('7z', constants.SZIP_FORMATS, constants.SEVENZIP),
+        ('LHA', constants.LHA_FORMATS, constants.LHA),
+        ('PDF', constants.PDF_FORMATS, constants.PDF),
+        ('MobiPocket', constants.MOBI_FORMATS, constants.MOBI),
+    )
+    if _get_handler(archive_type) is not None
+}
 
 def get_supported_formats():
-    global _SUPPORTED_ARCHIVE_FORMATS
-    if _SUPPORTED_ARCHIVE_FORMATS is None:
-        supported_formats = {}
-        for name, formats, is_available in (
-            ('ZIP', constants.ZIP_FORMATS , True            ),
-            ('Tar', constants.TAR_FORMATS , True            ),
-            ('RAR', constants.RAR_FORMATS , rar_available() ),
-            ('7z' , constants.SZIP_FORMATS, szip_available()),
-            ('LHA', constants.LHA_FORMATS , lha_available() ),
-            ('PDF', constants.PDF_FORMATS , pdf_available() ),
-            ('MobiPocket', constants.MOBI_FORMATS , mobi_available() ),
-        ):
-            if is_available:
-                supported_formats[name] = (set(formats[0]), set(formats[1]))
-        _SUPPORTED_ARCHIVE_FORMATS = supported_formats
     return _SUPPORTED_ARCHIVE_FORMATS
 
-_SUPPORTED_ARCHIVE_FORMATS = None
 # Set supported archive extensions regexp from list of supported formats.
 # Only used internally.
 _SUPPORTED_ARCHIVE_REGEX = tools.formats_to_regex(get_supported_formats())
@@ -156,7 +123,10 @@ def archive_mime_type(path):
                 istarfile = False
 
             if istarfile and os.path.getsize(path) > 0:
-                if magic.startswith(b'BZh'):
+                # tarfile also reads LZMA streams as XZ.
+                if magic[0:5] == b'\xFD7zXZ' or magic[0:5] == b']\x00\x00\x80\x00':
+                    return constants.XZ
+                elif magic.startswith(b'BZh'):
                     return constants.BZIP2
                 elif magic.startswith(b'\037\213'):
                     return constants.GZIP
@@ -168,10 +138,6 @@ def archive_mime_type(path):
 
             if magic[0:4] == b'7z\xBC\xAF':
                 return constants.SEVENZIP
-
-            # Headers for TAR-XZ and TAR-LZMA that aren't supported by tarfile
-            if magic[0:5] == b'\xFD7zXZ' or magic[0:5] == b']\x00\x00\x80\x00':
-                return constants.XZ
 
             if magic[2:4] == b'-l':
                 return constants.LHA

@@ -1,6 +1,7 @@
 """library_book_area.py - The window of the library that displays the covers of books."""
 
 import os
+from typing import List, Optional
 import urllib.request, urllib.parse, urllib.error
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, GObject
 import PIL.Image as Image
@@ -11,20 +12,45 @@ from mcomix import thumbnail_view
 from mcomix import file_chooser_library_dialog
 from mcomix import image_tools
 from mcomix import constants
-from mcomix import portability
 from mcomix import i18n
 from mcomix import status
 from mcomix import log
 from mcomix import message_dialog
 from mcomix import tools
+from mcomix.library import backend_types
 from mcomix.library.pixbuf_cache import get_pixbuf_cache
 from mcomix.i18n import _
-
-_dialog = None
 
 # The "All books" collection is not a real collection stored in the library, but is represented by this ID in the
 # library's TreeModels.
 _COLLECTION_ALL = -1
+
+
+def _local_file_uri_to_path(uri: str) -> Optional[str]:
+    """Decode a local file URI once, retaining Windows UNC authorities."""
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() != 'file' or parsed.query or parsed.fragment:
+        return None
+    authority = parsed.netloc
+    path = parsed.path
+    if authority and authority.lower() != 'localhost':
+        # Remote file authorities are UNC paths on Windows, never local paths
+        # on POSIX. User information and ports are not file-server names.
+        if os.name != 'nt' or any(char in authority for char in '\\:@'):
+            return None
+        path = '//' + authority + path
+    try:
+        path = urllib.request.url2pathname(path)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if '\x00' in path or not os.path.isabs(path):
+        return None
+    if os.name == 'nt' and not os.path.splitdrive(path)[0]:
+        return None
+    return path
 
 
 class _BookArea(Gtk.ScrolledWindow):
@@ -41,8 +67,14 @@ class _BookArea(Gtk.ScrolledWindow):
 
         self._library = library
         self._cache = get_pixbuf_cache()
+        self._closed = False
+        # Widget/theme access belongs to the GTK thread, before workers start.
+        self._finished_icon = self.render_icon(Gtk.STOCK_APPLY,
+                                               Gtk.IconSize.LARGE_TOOLBAR)
 
         self._library.backend.book_added_to_collection += self._new_book_added
+        self._library.backend.books_removed += self._books_removed
+        self.connect('destroy', self._detach_callbacks)
 
         self.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
 
@@ -176,13 +208,13 @@ class _BookArea(Gtk.ScrolledWindow):
             ('by path', None, _('Full path'), None, None, constants.SORT_PATH),
             ('by size', None, _('File size'), None, None, constants.SORT_SIZE),
             ('by date added', None, _('Date added'), None, None, constants.SORT_LAST_MODIFIED)],
-            prefs['lib sort key'], self._sort_changed)
+            prefs['lib sort key'], self._sort_key_changed)
         actiongroup.add_radio_actions([
             ('ascending', Gtk.STOCK_SORT_ASCENDING, _('Ascending'), None, None,
                 constants.SORT_ASCENDING),
             ('descending', Gtk.STOCK_SORT_DESCENDING, _('Descending'), None, None,
                 constants.SORT_DESCENDING)],
-            prefs['lib sort order'], self._sort_changed)
+            prefs['lib sort order'], self._sort_order_changed)
 
         # Library cover size
         actiongroup.add_radio_actions([
@@ -207,10 +239,20 @@ class _BookArea(Gtk.ScrolledWindow):
         self._ui_manager.insert_action_group(actiongroup, 0)
         library.add_accel_group(self._ui_manager.get_accel_group())
 
+    def _detach_callbacks(self, widget: Gtk.Widget) -> None:
+        self._library.backend.book_added_to_collection -= self._new_book_added
+        self._library.backend.books_removed -= self._books_removed
+        self.close()
+
     def close(self):
         """Run clean-up tasks for the _BookArea prior to closing."""
 
+        if self._closed:
+            return
+        self._closed = True
         self.stop_update()
+        # Free cover memory; this also rejects covers still being loaded.
+        self._cache.invalidate_all()
 
         # We must unselect all or we will trigger selection_changed events
         # when closing with multiple books selected.
@@ -222,6 +264,8 @@ class _BookArea(Gtk.ScrolledWindow):
     def display_covers(self, collection_id):
         """Display the books in <collection_id> in the IconView."""
 
+        if self._closed:
+            return
         adjustment = self.get_vadjustment()
         if adjustment:
             adjustment.set_value(0)
@@ -260,17 +304,27 @@ class _BookArea(Gtk.ScrolledWindow):
         if collection is None:
             collection = _COLLECTION_ALL
 
-        if (collection == self._library.collection_area.get_current_collection() or
-            self._library.collection_area.get_current_collection() == _COLLECTION_ALL):
-            # Make sure not to show a book twice when COLLECTION_ALL is selected
-            # and the book is added to another collection, triggering this event.
-            if self.is_book_displayed(book):
+        current = self._library.collection_area.get_current_collection()
+        if current is None:
+            return
+        if current != _COLLECTION_ALL and collection == _COLLECTION_ALL:
+            return
+        if current != _COLLECTION_ALL and collection != current:
+            descendants = self._library.backend.get_all_collections_in_collection(current)
+            if collection not in descendants:
                 return
+        # One book can be published for several memberships in this subtree.
+        if self.is_book_displayed(book):
+            return
+        if not self._library.filter_string or backend_types.matches_filter(
+                book.name, book.path, self._library.filter_string):
+            self.add_books([book])
 
-            # If the current view is filtered, only draw new books that match the filter
-            if not (self._library.filter_string and
-                    self._library.filter_string.lower() not in book.name.lower()):
-                self.add_books([book])
+    def _books_removed(self) -> None:
+        """ Callback function for L{LibraryBackend.books_removed}. """
+        current = self._library.collection_area.get_current_collection()
+        if current is not None:
+            self.display_covers(current)
 
     def is_book_displayed(self, book):
         """ Returns True when the current view contains the book passed.
@@ -298,11 +352,6 @@ class _BookArea(Gtk.ScrolledWindow):
         iterator = self._liststore.get_iter(path)
         return self._liststore.get_value(iterator, 1)
 
-    def get_book_path(self, book):
-        """Return the <path> to the book from the ListStore.
-        """
-        return self._liststore.get_iter(book)
-
     def open_selected_book(self, *args):
         """Open the currently selected book."""
         selected = self._iconview.get_selected_items()
@@ -328,23 +377,12 @@ class _BookArea(Gtk.ScrolledWindow):
 
         self._liststore.set_sort_column_id(prefs['lib sort key'], sortorder)
 
-    def _sort_changed(self, old, current):
-        """ Called whenever the sorting options changed. """
-        name = current.get_name()
-        if name == 'by name':
-            prefs['lib sort key'] = constants.SORT_NAME
-        elif name == 'by path':
-            prefs['lib sort key'] = constants.SORT_PATH
-        elif name == 'by size':
-            prefs['lib sort key'] = constants.SORT_SIZE
-        elif name == 'by date added':
-            prefs['lib sort key'] = constants.SORT_LAST_MODIFIED
+    def _sort_key_changed(self, old, current):
+        prefs['lib sort key'] = current.get_current_value()
+        self.set_sort_order()
 
-        if name == 'ascending':
-            prefs['lib sort order'] = constants.SORT_ASCENDING
-        elif name == 'descending':
-            prefs['lib sort order'] = constants.SORT_DESCENDING
-
+    def _sort_order_changed(self, old, current):
+        prefs['lib sort order'] = current.get_current_value()
         self.set_sort_order()
 
     def _sort_by_name(self, treemodel, iter1, iter2, user_data):
@@ -379,6 +417,9 @@ class _BookArea(Gtk.ScrolledWindow):
             cell.set_alignment(0.5, 0.5)
 
     def load_covers(self):
+        if self._closed:
+            return
+        self.stop_update()
         self._cache.invalidate_all()
         collection = self._library.collection_area.get_current_collection()
         GLib.idle_add(self.display_covers, collection)
@@ -386,18 +427,10 @@ class _BookArea(Gtk.ScrolledWindow):
     def _book_size_changed(self, old, current):
         """ Called when library cover size changes. """
         old_size = prefs['library cover size']
-        name = current.get_name()
-        if name == 'huge':
-            prefs['library cover size'] = constants.SIZE_HUGE
-        elif name == 'large':
-            prefs['library cover size'] = constants.SIZE_LARGE
-        elif name == 'normal':
-            prefs['library cover size'] = constants.SIZE_NORMAL
-        elif name == 'small':
-            prefs['library cover size'] = constants.SIZE_SMALL
-        elif name == 'tiny':
-            prefs['library cover size'] = constants.SIZE_TINY
-        elif name == 'custom':
+        size = current.get_current_value()
+        if size:
+            prefs['library cover size'] = size
+        else:  # Custom...
             dialog = message_dialog.MessageDialog(self._library, Gtk.DialogFlags.DESTROY_WITH_PARENT,
                 Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK)
             dialog.set_auto_destroy(False)
@@ -436,17 +469,21 @@ class _BookArea(Gtk.ScrolledWindow):
     def _get_pixbuf(self, uid):
         """ Get or create the thumbnail for the selected book <uid>. """
         assert isinstance(uid, int)
+        if self._closed:
+            return None
+        generation = self._cache.generation()
         book = self._library.backend.get_book_by_id(uid)
-        if self._cache.exists(book.path):
-            pixbuf = self._cache.get(book.path)
-        else:
+        if book is None:
+            return None
+        pixbuf = self._cache.get(book.path)
+        if pixbuf is None:
             width, height = self._pixbuf_size(border_size=0)
             try:
                 pixbuf = self._library.backend.get_book_thumbnail(book.path) or image_tools.MISSING_IMAGE_ICON
             except:
                 pixbuf = image_tools.MISSING_IMAGE_ICON
             pixbuf = image_tools.fit_in_rectangle(pixbuf, width, height, scale_up=True)
-            self._cache.add(book.path, pixbuf)
+            self._cache.add(book.path, pixbuf, generation)
 
         pixbuf = self._library._window.enhancer.enhance(pixbuf);
         pixbuf = image_tools.add_border(pixbuf, 1, 0xFFFFFFFF)
@@ -463,7 +500,9 @@ class _BookArea(Gtk.ScrolledWindow):
             return pixbuf
 
         # Composite icon on the lower right corner of the book cover pixbuf.
-        book_pixbuf = self.render_icon(Gtk.STOCK_APPLY, Gtk.IconSize.LARGE_TOOLBAR)
+        book_pixbuf = self._finished_icon
+        if book_pixbuf is None:
+            return pixbuf
         translation_x = pixbuf.get_width() - book_pixbuf.get_width() - 1
         translation_y = pixbuf.get_height() - book_pixbuf.get_height() - 1
         book_pixbuf.composite(pixbuf, translation_x, translation_y,
@@ -528,34 +567,36 @@ class _BookArea(Gtk.ScrolledWindow):
         self._library.set_status_message(
             message % {'num': len(selected), 'collection': coll_name})
 
-    def _remove_books_from_library(self, *args):
-        """Remove the currently selected books from the library, and thus
-        also from the _BookArea.
-        """
-
-        selected = self._iconview.get_selected_items()
+    def _remove_book_ids_from_library(self, books: List[int]) -> None:
+        """Remove stable book identities despite sorting or row removals."""
         self._library.backend.begin_transaction()
-
-        for path in selected:
-            book = self.get_book_at_path(path)
-            self._library.backend.remove_book(book)
-            self.remove_book_at_path(path)
-
-        self._library.backend.end_transaction()
-
+        try:
+            for book in books:
+                self._library.backend.remove_book(book)
+                for row in self._liststore:
+                    if row[1] == book:
+                        self.remove_book_at_path(row.path)
+                        break
+        finally:
+            self._library.backend.end_transaction()
         msg = i18n.get_translation().ngettext(
             'Removed %d book from the library.',
-            'Removed %d books from the library.',
-            len(selected))
-        self._library.set_status_message(msg % len(selected))
+            'Removed %d books from the library.', len(books))
+        self._library.set_status_message(msg % len(books))
+
+    def _remove_books_from_library(self, *args):
+        """Remove the selected books using IDs captured before model edits."""
+        books = [self.get_book_at_path(path)
+                 for path in self._iconview.get_selected_items()]
+        self._remove_book_ids_from_library(books)
 
     def _completely_remove_book(self, request_response=True, *args):
-        """Remove the currently selected books from the library and the
-        hard drive.
-        """
-
+        """Delete first; failed files retain their library and view entries."""
+        books = [(self.get_book_at_path(path), self._liststore[path][2])
+                 for path in self._iconview.get_selected_items()]
+        if not books:
+            return
         if request_response:
-
             choice_dialog = message_dialog.MessageDialog(self._library, 0,
                 Gtk.MessageType.QUESTION, Gtk.ButtonsType.YES_NO)
             choice_dialog.set_default_response(Gtk.ResponseType.YES)
@@ -564,41 +605,48 @@ class _BookArea(Gtk.ScrolledWindow):
             choice_dialog.set_text(
                 _('Remove books from the library?'),
                 _('The selected books will be removed from the library and '
-                  'permanently deleted. Are you sure that you want to continue?')
-            )
-            response = choice_dialog.run()
-
-        # if no request is needed or the user has told us they definitely want to delete the book
-        if not request_response or (request_response and response == Gtk.ResponseType.YES):
-
-            # get the array of currently selected books in the book window
-            selected_books = self._iconview.get_selected_items()
-            book_ids = [ self.get_book_at_path(book) for book in selected_books ]
-            paths = [ self._library.backend.get_book_path(book_id) for book_id in book_ids ]
-
-            # Remove books from library
-            self._remove_books_from_library()
-
-            # Remove from the harddisk
-            for book_path in paths:
-                try:
-                    # try to delete the book.
-                    # this can throw an exception if the path points to folder instead
-                    # of a single file
-                    os.remove(book_path)
-                except Exception:
-                    log.error(_('! Could not remove file "%s"'), book_path)
+                  'permanently deleted. Are you sure that you want to continue?'))
+            if choice_dialog.run() != Gtk.ResponseType.YES:
+                return
+        handler = self._library._file_handler
+        if self._library._closed or handler._shutting_down:
+            return
+        removed = []
+        errors = []
+        for book, path in books:
+            # A modal confirmation may have let another action remove this ID.
+            if self._library.backend.get_book_path(book) != path:
+                continue
+            try:
+                source = handler.get_path_to_base() if handler.archive_type is not None else None
+                if source and os.path.exists(source) and os.path.samefile(source, path):
+                    if handler._file_operation_active or handler._shutting_down:
+                        raise RuntimeError(_('The current book is busy. Please try again.'))
+                    handler.close_file(wait_for_release=True)
+                    if self._library._closed or handler._shutting_down:
+                        return
+                handler.wait_for_file_release(path)
+                os.remove(path)
+            except Exception as error:
+                log.error(_('! Could not remove file "%s"'), path)
+                errors.append('%s: %s' % (path, error))
+            else:
+                removed.append(book)
+        self._remove_book_ids_from_library(removed)
+        if errors:
+            dialog = message_dialog.MessageDialog(
+                self._library, 0, Gtk.MessageType.ERROR, Gtk.ButtonsType.CLOSE)
+            dialog.set_text(_('Some books could not be deleted.'),
+                            '\n'.join(errors))
+            dialog.run()
 
     def _copy_selected(self, *args):
-        """ Copies the currently selected item to clipboard. """
+        """ Copies the selected book's path to clipboard. """
         paths = self._iconview.get_selected_items()
         if len(paths) == 1:
             model = self._iconview.get_model()
-            iter = model.get_iter(paths[0])
-            path = model.get_value(iter, 2).decode('utf-8')
-            pixbuf = model.get_value(iter, 0)
-
-            self._library._window.clipboard.copy(path, pixbuf)
+            path = model.get_value(model.get_iter(paths[0]), 2)
+            self._library._window.clipboard.copy_text(path)
 
     def _button_press(self, iconview, event):
         """Handle mouse button presses on the _BookArea."""
@@ -662,12 +710,15 @@ class _BookArea(Gtk.ScrolledWindow):
         num_books = len(iconview.get_selected_items())
         book = self.get_book_at_path(icon_path)
 
-        cover: GdkPixbuf.Pixbuf = self._library.backend.get_book_cover(book)
+        try:
+            cover: Optional[GdkPixbuf.Pixbuf] = self._library.backend.get_book_cover(book)
+        except Exception:  # A damaged cover, as _get_pixbuf allows.
+            cover = None
         if cover is None:
             cover = image_tools.MISSING_IMAGE_ICON
 
         cover = cover.scale_simple(max(0, cover.get_width() // 2),
-            max(0, cover.get_height() // 2), prefs['scaling quality'])
+            max(0, cover.get_height() // 2), image_tools.gdk_scaling_quality())
         cover = image_tools.add_border(cover, 1, 0xFFFFFFFF)
         cover = image_tools.add_border(cover, 1)
 
@@ -680,7 +731,7 @@ class _BookArea(Gtk.ScrolledWindow):
                                            height=max(30, cover_height + 10))
             pointer.fill(0x00000000)
             cover.composite(pointer, 0, 0, cover_width, cover_height, 0, 0,
-            1, 1, prefs['scaling quality'], 255)
+            1, 1, image_tools.gdk_scaling_quality(), 255)
             im = Image.new('RGBA', (30, 30), 0x00000000)
             draw = ImageDraw.Draw(im)
             draw.polygon(
@@ -695,7 +746,7 @@ class _BookArea(Gtk.ScrolledWindow):
             circle = image_tools.pil_to_pixbuf(im)
             circle.composite(pointer, max(0, cover_width - 15),
                 max(0, cover_height - 20), 30, 30, max(0, cover_width - 15),
-                max(0, cover_height - 20), 1, 1, prefs['scaling quality'], 255)
+                max(0, cover_height - 20), 1, 1, image_tools.gdk_scaling_quality(), 255)
         else:
             pointer = cover
 
@@ -714,16 +765,19 @@ class _BookArea(Gtk.ScrolledWindow):
         """Handle drag-n-drop events ending on the book area (i.e. from
         external apps like the file manager).
         """
+        if self._library._closed:
+            return
         uris = data.get_uris()
         if not uris:
             return
 
-        uris = [ portability.normalize_uri(uri) for uri in uris ]
-        paths = [ urllib.request.url2pathname(uri).decode('utf-8') for uri in uris ]
+        paths = [_local_file_uri_to_path(uri) for uri in uris]
+        paths = [path for path in paths if path is not None]
+        if not paths:
+            return
 
         collection = self._library.collection_area.get_current_collection()
-        collection_name = self._library.backend.get_collection_name(collection)
-        self._library.add_books(paths, collection_name)
+        self._library.add_books(paths, collection_id=collection)
 
 
 # vim: expandtab:sw=4:ts=4

@@ -33,8 +33,14 @@ class OpenWithMenu(Gtk.Menu):
         self._window.filehandler.file_opened += self._set_sensitivity
         self._window.filehandler.file_closed += self._set_sensitivity
         self._openwith_manager.set_commands += self._construct_menu
+        self.connect('destroy', self._detach_callbacks)
 
         self.show_all()
+
+    def _detach_callbacks(self, widget: Gtk.Widget) -> None:
+        self._window.filehandler.file_opened -= self._set_sensitivity
+        self._window.filehandler.file_closed -= self._set_sensitivity
+        self._openwith_manager.set_commands -= self._construct_menu
 
     def _construct_menu(self, *args):
         """ Build the menu entries from scratch. """

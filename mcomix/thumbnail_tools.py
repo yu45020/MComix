@@ -2,7 +2,9 @@
 freedesktop.org "standard" at http://jens.triq.net/thumbnail-spec/
 """
 
+import io
 import os
+import stat
 import re
 import shutil
 import tempfile
@@ -20,7 +22,6 @@ from mcomix import archive_tools
 from mcomix import tools
 from mcomix import image_tools
 from mcomix import portability
-from mcomix import callback
 from mcomix import log
 from mcomix.i18n import _
 
@@ -35,7 +36,7 @@ class Thumbnailer(object):
     or simply creates new thumbnails each time it is called. """
 
     def __init__(self, dst_dir=constants.THUMBNAIL_PATH, store_on_disk=None,
-                 size=None, force_recreation=False, archive_support=False):
+                 size=None, archive_support=False):
         """
         <dst_dir> set the thumbnailer's storage directory.
 
@@ -46,9 +47,6 @@ class Thumbnailer(object):
 
         The dimensions for the created thumbnails is set by <size>, a (width,
         height) tupple. Defaults to the 'thumbnail size' preference if not set.
-
-        If <force_recreation> is True, thumbnails stored on disk
-        will always be re-created instead of being re-used.
 
         If <archive_support> is True, support for archive thumbnail creation
         (based on cover detection) is enabled. Otherwise, only image files are
@@ -61,49 +59,33 @@ class Thumbnailer(object):
             self.store_on_disk = store_on_disk
         if size is None:
             self.width = self.height = prefs['thumbnail size']
-            self.default_sizes = True
         else:
             self.width, self.height = size
-            self.default_sizes = False
-        self.force_recreation = force_recreation
         self.archive_support = archive_support
+        self._cancelled = threading.Event()
+        self._archive_lock = threading.Lock()
+        self._archive = None
 
-    def thumbnail(self, filepath: str, threaded: bool = False) -> Optional["GdkPixbuf.Pixbuf"]:
+    def thumbnail(self, filepath: str) -> Optional["GdkPixbuf.Pixbuf"]:
         """ Returns a thumbnail pixbuf for <filepath>, transparently handling
         both normal image files and archives. If a thumbnail file already exists,
         it is re-used. Otherwise, a new thumbnail is created from <filepath>.
 
-        Returns None if thumbnail creation failed, or if the thumbnail creation
-        is run asynchrounosly. """
+        Returns None if thumbnail creation failed. """
 
-        # Update width and height from preferences if they haven't been set explicitly
-        if self.default_sizes:
-            self.width = prefs['thumbnail size']
-            self.height = prefs['thumbnail size']
-
-        if self._thumbnail_exists(filepath):
-            thumbpath = self._path_to_thumbpath(filepath)
-            pixbuf = image_tools.load_pixbuf(thumbpath)
-            self.thumbnail_finished(filepath, pixbuf)
+        if self._cancelled.is_set():
+            return None
+        pixbuf = self._cached_thumbnail(filepath)
+        if pixbuf is not None:
             return pixbuf
+        return self._create_thumbnail(filepath)
 
-        else:
-            if threaded:
-                thread = threading.Thread(target=self._create_thumbnail, args=(filepath,))
-                thread.name += '-thumbnailer'
-                thread.setDaemon(True)
-                thread.start()
-                return None
-            else:
-                return self._create_thumbnail(filepath)
-
-    @callback.Callback
-    def thumbnail_finished(self, filepath, pixbuf):
-        """ Called every time a thumbnail has been completed.
-        <filepath> is the file that was used as source, <pixbuf> is the
-        resulting thumbnail. """
-
-        pass
+    def cancel(self) -> None:
+        """Cancel owned archive/password work; a decoder already running may finish."""
+        self._cancelled.set()
+        with self._archive_lock:
+            if self._archive is not None:
+                self._archive.cancel()
 
     def delete(self, filepath):
         """ Deletes the thumbnail for <filepath> (if it exists) """
@@ -134,27 +116,43 @@ class Thumbnailer(object):
                 if archive is None:
                     return None, None
                 cleanup.append(archive.close)
+                with self._archive_lock:
+                    self._archive = archive
+                    if self._cancelled.is_set():
+                        archive.cancel()
+                if self._cancelled.is_set():
+                    return None, None
                 files = archive.list_contents()
+                if self._cancelled.is_set():
+                    return None, None
                 wanted = self._guess_cover(files)
                 if wanted is None:
                     return None, None
 
-                archive.extract(wanted, tmpdir)
-
-                image_path = os.path.join(tmpdir, wanted)
-                if not os.path.isfile(image_path):
+                # Read the cover into memory instead of extracting it.
+                try:
+                    image_data = archive.read(wanted)
+                except Exception as ex:
+                    log.debug('Could not read cover "%s" of "%s": %s', wanted, filepath, ex)
+                    return None, None
+                if not image_data:
                     return None, None
 
-                pixbuf = image_tools.load_pixbuf_size(image_path, self.width, self.height)
+                pixbuf = image_tools.load_pixbuf_size(image_data, self.width, self.height)
                 if self.store_on_disk:
-                    tEXt_data = self._get_text_data(image_path)
-                    # Use the archive's mTime instead of the extracted file's mtime
-                    tEXt_data['tEXt::Thumb::MTime'] = str(int(os.stat(filepath).st_mtime))
+                    # Describe the archive (the thumbnailed file),
+                    # with the dimensions of its cover.
+                    tEXt_data = self._get_text_data(filepath)
+                    width, height = image_tools.get_image_info(image_data)[1]
+                    tEXt_data['tEXt::Thumb::Image::Width'] = str(width)
+                    tEXt_data['tEXt::Thumb::Image::Height'] = str(height)
                 else:
                     tEXt_data = None
 
                 return pixbuf, tEXt_data
             finally:
+                with self._archive_lock:
+                    self._archive = None
                 for fn in reversed(cleanup):
                     fn()
 
@@ -169,17 +167,21 @@ class Thumbnailer(object):
         else:
             return None, None
 
-    def _create_thumbnail(self, filepath):
+    def _create_thumbnail(self, filepath: str) -> Optional["GdkPixbuf.Pixbuf"]:
         """ Creates the thumbnail pixbuf for <filepath>, and saves the pixbuf
         to disk if necessary. Returns the created pixbuf, or None, if creation failed. """
 
-        pixbuf, tEXt_data = self._create_thumbnail_pixbuf(filepath)
-        self.thumbnail_finished(filepath, pixbuf)
-
-        if pixbuf and self.store_on_disk:
-            thumbpath = self._path_to_thumbpath(filepath)
-            self._save_thumbnail(pixbuf, thumbpath, tEXt_data)
-
+        if self._cancelled.is_set():
+            return None
+        try:
+            pixbuf, tEXt_data = self._create_thumbnail_pixbuf(filepath)
+        except Exception as error:
+            log.debug('Could not create thumbnail for "%s": %s', filepath, error)
+            raise
+        if self._cancelled.is_set():
+            return None
+        if pixbuf is not None and self.store_on_disk:
+            self._save_thumbnail(pixbuf, self._path_to_thumbpath(filepath), tEXt_data)
         return pixbuf
 
     def _get_text_data(self, filepath):
@@ -190,7 +192,7 @@ class Thumbnailer(object):
         # MTime could be floating point number, so convert to long first to have a fixed point number
         mtime = str(int(stat.st_mtime))
         size = str(stat.st_size)
-        format, (width, height), providers = image_tools.get_image_info(filepath)
+        width, height = image_tools.get_image_info(filepath)[1]
         return {
             'tEXt::Thumb::URI':           uri,
             'tEXt::Thumb::MTime':         mtime,
@@ -198,6 +200,7 @@ class Thumbnailer(object):
             'tEXt::Thumb::Mimetype':      mime,
             'tEXt::Thumb::Image::Width':  str(width),
             'tEXt::Thumb::Image::Height': str(height),
+            'tEXt::MComix::Thumb::Size':  self._requested_size(),
             'tEXt::Software':             'MComix %s' % constants.VERSION
         }
 
@@ -224,33 +227,47 @@ class Thumbnailer(object):
             log.warning( _('! Could not save thumbnail "%(thumbpath)s": %(error)s'),
                 { 'thumbpath' : thumbpath, 'error' : ex } )
 
-    def _thumbnail_exists(self, filepath):
-        """ Checks if the thumbnail for <filepath> already exists.
-        This function will return False if the thumbnail exists
-        and it's mTime doesn't match the mTime of <filepath>,
-        it's size is different from the one specified in the thumbnailer,
-        or if <force_recreation> is True. """
+    def _requested_size(self) -> str:
+        """ Return the bounding box recorded with saved thumbnails. """
+        return '%dx%d' % (self.width, self.height)
 
-        if not self.force_recreation:
-            thumbpath = self._path_to_thumbpath(filepath)
-
-            if os.path.isfile(thumbpath):
-                # Check the thumbnail's stored mTime
-                try:
-                    img = Image.open(thumbpath)
-                except IOError:
-                    return False
-
+    def _cached_thumbnail(self, filepath: str) -> Optional["GdkPixbuf.Pixbuf"]:
+        """Return the disk thumbnail of <filepath> when its identity, source
+        freshness and requested size match and its pixels decode, else None."""
+        thumbpath = self._path_to_thumbpath(filepath)
+        try:
+            with open(thumbpath, 'rb') as cache:
+                data = cache.read()
+            # verify() checks every chunk CRC but leaves the image unusable,
+            # and load() checks no CRC from IDAT on: parse twice, decode once.
+            with Image.open(io.BytesIO(data)) as img:
                 info = img.info
-                stored_mtime = int(float(info['Thumb::MTime']))
-                # The source file might no longer exist
-                file_mtime = os.path.isfile(filepath) and int(os.stat(filepath).st_mtime) or stored_mtime
-                return stored_mtime == file_mtime and \
-                    max(*img.size) == max(self.width, self.height)
-            else:
-                return False
-        else:
-            return False
+                uri = portability.uri_prefix() + pathname2url(os.path.normpath(filepath))
+                if info.get('Thumb::URI') != uri:
+                    return None
+                if info.get('MComix::Thumb::Size') != self._requested_size():
+                    return None
+                stored_mtime = int(info['Thumb::MTime'])
+                stored_size = int(info['Thumb::Size'])
+                try:
+                    source_stat = os.stat(filepath)
+                except FileNotFoundError:
+                    # Keep covers available for temporarily offline library books.
+                    source_stat = None
+                if source_stat is not None:
+                    if not stat.S_ISREG(source_stat.st_mode):
+                        return None
+                    if stored_mtime != int(source_stat.st_mtime) or stored_size != source_stat.st_size:
+                        return None
+                img.verify()
+            with Image.open(io.BytesIO(data)) as img:
+                # Valid CRCs can still frame pixel data that doesn't decode.
+                img.load()
+                return image_tools.pil_to_pixbuf(img, keep_orientation=True)
+        except Exception:
+            # Missing, corrupt or incompatible thumbnails are disposable caches,
+            # and a malformed chunk can raise anything from Pillow's parser.
+            return None
 
     def _path_to_thumbpath(self, filepath):
         """ Converts <path> to an URI for the thumbnail in <dst_dir>. """

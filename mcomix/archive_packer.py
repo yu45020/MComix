@@ -40,7 +40,7 @@ class Packer(object):
         """Pack all the files in the file lists into the archive."""
         self._pack_thread = threading.Thread(target=self._thread_pack)
         self._pack_thread.name += '-pack'
-        self._pack_thread.setDaemon(False)
+        self._pack_thread.daemon = False
         self._pack_thread.start()
 
     def wait(self):
@@ -60,56 +60,32 @@ class Packer(object):
                       self._archive_path)
             return
 
-        used_names = []
         pattern = '%%0%dd - %s%%s' % (len(str(len(self._image_files))),
             self._base_name)
-
-        for i, path in enumerate(self._image_files):
-            filename = pattern % (i + 1, os.path.splitext(path)[1])
-
-            try:
-                zfile.write(path, filename, zipfile.ZIP_STORED)
-            except Exception:
-                log.error(_('! Could not add file %(sourcefile)s '
-                            'to archive %(archivefile)s, aborting...'),
-                          { "sourcefile" : path,
-                            "archivefile" : self._archive_path})
-
-                zfile.close()
-
-                try:
-                    os.remove(self._archive_path)
-                except:
-                    pass
-
-                return
-
-            used_names.append(filename)
-
+        entries = [(path, pattern % (i + 1, os.path.splitext(path)[1]), zipfile.ZIP_STORED)
+                   for i, path in enumerate(self._image_files)]
+        used_names = [filename for path, filename, compression in entries]
         for path in self._other_files:
             filename = os.path.basename(path)
-
             while filename in used_names:
                 filename = '_%s' % filename
+            used_names.append(filename)
+            entries.append((path, filename, zipfile.ZIP_DEFLATED))
 
+        for path, filename, compression in entries:
             try:
-                zfile.write(path, filename, zipfile.ZIP_DEFLATED)
+                zfile.write(path, filename, compression)
             except Exception:
                 log.error(_('! Could not add file %(sourcefile)s '
                             'to archive %(archivefile)s, aborting...'),
                           { "sourcefile" : path,
                             "archivefile" : self._archive_path})
-
                 zfile.close()
-
                 try:
                     os.remove(self._archive_path)
-                except:
+                except OSError:
                     pass
-
                 return
-
-            used_names.append(filename)
 
         zfile.close()
         self._packing_successful = True

@@ -8,10 +8,6 @@ import math
 
 class Scrolling(object):
 
-    def __init__(self):
-        self.clear_cache()
-
-
     def scroll_smartly(self, content_box, viewport_box, orientation, max_scroll,
         axis_map=None):
         """ Returns a new viewport position when reading forwards using
@@ -102,7 +98,7 @@ class Scrolling(object):
                     break
                 # If orientation is -1, we need to round half up instead of
                 # half down.
-                positions = self._cached_bs(invisible_size, steps_to_take, o == -1)
+                positions = Scrolling._bresenham_sums(invisible_size, steps_to_take, o == -1)
 
                 # Where are we now (according to the grid)?
                 index = tools.bin_search(positions, viewport_position[i])
@@ -132,9 +128,9 @@ class Scrolling(object):
             # No space left.
             return []
 
-        # Undo axis remapping, if any
+        # Undo axis remapping, if any. Every axis map is its own inverse.
         if axis_map is not None:
-            result = tools.remap_axes(result, tools.inverse_axis_map(axis_map))
+            result = tools.remap_axes(result, axis_map)
 
         return tools.vector_add(result, offset)
 
@@ -167,7 +163,7 @@ class Scrolling(object):
             if d == 0:
                 continue
             if d < constants.SCROLL_TO_END or d > 1:
-                raise ValueError("invalid destination " + d + " at index "+ i)
+                raise ValueError('invalid destination %s at index %s' % (d, i))
             if d == constants.SCROLL_TO_END:
                 d = o
             if d == constants.SCROLL_TO_START:
@@ -180,29 +176,6 @@ class Scrolling(object):
                 else invisible_size if d == 1
                 else 0) # if d == -1
         return result
-
-
-    def _cached_bs(self, num, denom, half_up):
-        """ A simple (and ugly) caching mechanism used to avoid
-        recomputations. The current implementation offers a cache with
-        only two entries so it's only useful for the two "fastest"
-        dimensions. """
-        if (self._cache0[0] != num or
-            self._cache0[1] != denom or
-            self._cache0[2] != half_up):
-            self._cache0, self._cache1 = self._cache1, self._cache0
-        if (self._cache0[0] != num or
-            self._cache0[1] != denom or
-            self._cache0[2] != half_up):
-            self._cache0 = (num, denom, half_up,
-                Scrolling._bresenham_sums(num, denom, half_up))
-        return self._cache0[3]
-
-
-    def clear_cache(self):
-        """ Clears all caches that are used internally. """
-        self._cache0 = (0, 0, False, [])
-        self._cache1 = (0, 0, False, [])
 
 
     @staticmethod

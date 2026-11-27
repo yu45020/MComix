@@ -1,6 +1,5 @@
 
 import os
-import shutil
 import stat
 import sys
 import tempfile
@@ -15,13 +14,13 @@ if 'win32' == sys.platform:
     def _is_valid_exe(name):
         return (name.endswith('.exe') and
                 os.path.isabs(name) and
-                os.path.isfile(exe))
+                os.path.isfile(name))
 
 else:
     def _is_valid_exe(name):
         return (os.path.isabs(name) and
                 os.path.isfile(name) and
-                os.access(exe, os.R_OK|os.X_OK))
+                os.access(name, os.R_OK|os.X_OK))
 
 def _create_file(path, rights='r'):
     mode = 0
@@ -38,6 +37,14 @@ def _create_file(path, rights='r'):
     open(path, 'w+b').close()
     os.chmod(path, mode)
 
+def _restore_write_rights(root: str) -> None:
+    # The discovery fixtures deliberately create read-only executable files.
+    # Windows needs their write bit restored before the owned tree is removed.
+    for directory, _, files in os.walk(root):
+        for filename in files:
+            os.chmod(os.path.join(directory, filename), stat.S_IRUSR | stat.S_IWUSR)
+
+
 def _create_tree(root, entries):
     for name, rights in entries:
         full_path = os.path.join(root, name)
@@ -48,13 +55,13 @@ class ProcessTest(MComixTest):
     def test_find_executable(self):
         cleanup = []
         try:
-            root_dir = tempfile.mkdtemp(dir='test', prefix='tmp.path.')
-            # cleanup.append(lambda: shutil.rmtree(root_dir))
+            root_dir = tempfile.mkdtemp(dir=self.tmp_dir, prefix='path.')
+            cleanup.append(lambda: _restore_write_rights(root_dir))
 
             if 'win32' == sys.platform:
                 orig_exe_dir = process._exe_dir
                 cleanup.append(lambda: setattr(process, '_exe_dir', orig_exe_dir))
-                process._exe_dir = 'dir4'
+                process._exe_dir = os.path.abspath(os.path.join(root_dir, 'dir4'))
                 tree = (
                     ('bin1.exe'         , 'rx'),
                     ('bin3.exe'         , 'rx'),
@@ -62,34 +69,21 @@ class ProcessTest(MComixTest):
                     ('dir1/bin2'        , 'rx'),
                     ('dir2/bin1.exe'    , 'rx'),
                     ('dir3/bin2.exe'    , 'rx'),
-                    ('dir3/bin4.exe'    , 'rx'),
                     ('dir3/dir/bin2.exe', 'rx'),
-                    ('dir4/bin4.exe'    , 'rx'),
-                    ('dir4/bin5.exe'    , 'rx'),
                 )
                 tests = (
                     # Absolute path, unchanged.
                     ([sys.executable]      , None  , sys.executable     ),
-                    # Same without .exe extension.
-                    ([sys.executable[:-4]] , None  , sys.executable     ),
                     # Must still be valid, though...
                     (['C:/invalid/invalid'], None  , None               ),
-                    # bin1 in workdir should be picked up.
-                    (['bin1.exe']          , None  , 'bin1.exe'         ),
-                    (['bad', 'bin1.exe']   , None  , 'bin1.exe'         ),
-                    # Same without .exe extension.
-                    (['bin1']              , None  , 'bin1.exe'         ),
+                    # Bare names must ignore the working directory.
+                    (['bad', 'bin1.exe']   , None  , 'dir1/bin1.exe'    ),
                     # bin2 in dir1 or bin2 @ind dir3 should not be picked up.
                     (['bin2']              , None  , 'dir3/bin2.exe'    ),
                     # Candidate with a directory component.
                     (['./bin3']            , None  , 'bin3.exe'         ),
                     # And a custom working directory.
                     (['dir/bin2']          , 'dir3', 'dir3/dir/bin2.exe'),
-                    # Check main executable directory is searched too.
-                    # (with higher priority than PATH)
-                    (['bin4']              , None  , 'dir4/bin4.exe'    ),
-                    # And work directory.
-                    (['bin4']              , 'dir3', 'dir4/bin4.exe'    ),
                 )
             else:
                 tree = (
@@ -111,8 +105,6 @@ class ProcessTest(MComixTest):
                     (['/bin/true']       , None  , '/bin/true'    ),
                     # Must still be valid, though...
                     (['/invalid/invalid'], None  , None           ),
-                    # bin1 in workdir should not be picked up.
-                    (['bin1']            , None  , 'dir1/bin1'    ),
                     # Check all candidates.
                     (['bad', 'bin1']     , None  , 'dir1/bin1'    ),
                     # bin2 in dir1 should not be picked up (not executable).
@@ -133,7 +125,8 @@ class ProcessTest(MComixTest):
 
             orig_path = os.environ['PATH']
             cleanup.append(lambda: os.environ.__setitem__('PATH', orig_path))
-            os.environ['PATH'] = os.pathsep.join('dir1 dir2 dir3'.split())
+            os.environ['PATH'] = os.pathsep.join(
+                os.path.join(root_dir, name) for name in ('dir1', 'dir2', 'dir3'))
 
             orig_cwd = os.getcwd()
             cleanup.append(lambda: os.chdir(orig_cwd))

@@ -14,7 +14,6 @@ from mcomix.i18n import _
 if TYPE_CHECKING:
     from mcomix.library.main_dialog import _LibraryDialog
 
-_dialog = None
 # The "All books" collection is not a real collection stored in the library,
 # but is represented by this ID in the library's TreeModels.
 _COLLECTION_ALL = -1

@@ -1,7 +1,6 @@
 """bookmark_menu_item.py - A signle bookmark item."""
 
 from gi.repository import Gtk
-from mcomix import i18n
 
 class _Bookmark(Gtk.ImageMenuItem):
 
@@ -45,14 +44,6 @@ class _Bookmark(Gtk.ImageMenuItem):
             self._window.toolbar.hide()
             self._window.toolbar.show()
 
-    def same_path(self, path):
-        """Return True if the bookmark is for the file <path>."""
-        return path == self._path
-
-    def same_page(self, page):
-        """Return True if the bookmark is for the same page."""
-        return page == self._page
-
     def to_row(self):
         """Return a tuple corresponding to one row in the _BookmarkDialog's
         ListStore.
@@ -62,8 +53,7 @@ class _Bookmark(Gtk.ImageMenuItem):
         page = '%d / %d' % (self._page, self._numpages)
         date = self._date_added.strftime("%x %X")
 
-        return (pixbuf, self._name, page, i18n.to_display_string(self._path),
-            date, self)
+        return (pixbuf, self._name, page, date, self)
 
     def pack(self):
         """Return a tuple suitable for pickling. The bookmark can be fully

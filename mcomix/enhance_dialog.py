@@ -103,9 +103,18 @@ class _EnhanceImageDialog(Gtk.Dialog):
         self._window.imagehandler.page_available += self._on_page_available
         self._window.filehandler.file_closed += self._on_book_close
         self._window.page_changed += self._on_page_change
+        self.connect('destroy', self._detach_callbacks)
         self._on_page_change()
 
         self.show_all()
+
+    def _detach_callbacks(self, widget: Gtk.Widget) -> None:
+        global _dialog
+        self._window.imagehandler.page_available -= self._on_page_available
+        self._window.filehandler.file_closed -= self._on_book_close
+        self._window.page_changed -= self._on_page_change
+        if _dialog is self:
+            _dialog = None
 
     def _on_book_close(self):
         self.clear_histogram()
@@ -126,7 +135,7 @@ class _EnhanceImageDialog(Gtk.Dialog):
     def draw_histogram(self, pixbuf):
         """Draw a histogram representing <pixbuf> in the dialog."""
         pixbuf = image_tools.static_image(pixbuf)
-        histogram_pixbuf = histogram.draw_histogram(pixbuf, text=False)
+        histogram_pixbuf = histogram.draw_histogram(pixbuf)
         self._hist_image.set_from_pixbuf(histogram_pixbuf)
 
     def clear_histogram(self):

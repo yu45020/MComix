@@ -32,18 +32,23 @@ class _CommentsDialog(Gtk.Dialog):
         self._tag_table = tag_table
         self._notebook = None
         self._window = window
-        self._comments = []
 
         self._window.filehandler.file_available += self._on_file_available
         self._window.filehandler.file_opened += self._update_comments
         self._window.filehandler.file_closed += self._update_comments
+        self.connect('destroy', self._detach_callbacks)
         self._update_comments()
         self.show_all()
 
+    def _detach_callbacks(self, widget: Gtk.Widget) -> None:
+        self._window.filehandler.file_available -= self._on_file_available
+        self._window.filehandler.file_opened -= self._update_comments
+        self._window.filehandler.file_closed -= self._update_comments
+
     def _on_file_available(self, path_list):
         for path in path_list:
-            if path in self._comments:
-                self._add_comment(path, self._comments[path])
+            if path in self._pending:
+                self._add_comment(path, self._pending.pop(path))
         self._notebook.show_all()
 
     def _update_comments(self):
@@ -57,17 +62,18 @@ class _CommentsDialog(Gtk.Dialog):
         notebook.set_border_width(6)
         self.vbox.pack_start(notebook, True, True, 0)
         self._notebook = notebook
-        self._comments = {}
+        # Comments not shown yet, by path; file_available adds them.
+        self._pending = {}
 
         for num in range(1, self._window.filehandler.get_number_of_comments() + 1):
             path = self._window.filehandler.get_comment_name(num)
             if self._window.filehandler.file_is_available(path):
                 self._add_comment(path, num)
             else:
+                self._pending[path] = num
                 # In case it's not ready yet, bump it's
                 # extraction in front of the queue.
                 self._window.filehandler._ask_for_files([path])
-            self._comments[path] = num
 
         self._notebook.show_all()
 

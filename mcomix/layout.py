@@ -71,21 +71,17 @@ class FiniteLayout(object): # 2D only
         self.dirty_current_index = True
 
 
-    def scroll_smartly(self, max_scroll, backwards, axis_map, index=None):
+    def scroll_smartly(self, max_scroll, backwards, axis_map):
         """ Applies a "smart scrolling" step to the current viewport position.
         If there are not enough Boxes to scroll to, the viewport is not moved
         and an appropriate value is returned.
         @param max_scroll: The maximum numbers of pixels to scroll in one step.
         @param backwards: True for backwards scrolling, False otherwise.
         @param axis_map: The index of the dimension to modify.
-        @param index: The index of the Box the scrolling step is related to,
-        or None to use the index of the current Box.
         @return: The index of the current Box after scrolling, or -1 if there
         were not enough Boxes to scroll backwards, or the number of Boxes if
         there were not enough Boxes to scroll forwards. """
-        # TODO reconsider interface
-        if (index == None) or (not self.wrap_individually):
-            index = self.get_current_index()
+        index = self.get_current_index()
         if not self.wrap_individually:
             wrapper_index = 0
         else:
@@ -149,12 +145,6 @@ class FiniteLayout(object): # 2D only
         return self.content_distorted
 
 
-    def get_wrapper_boxes(self):
-        """ Returns the wrapper Boxes as they are arranged in this layout.
-        @return: The wrapper Boxes as they are arranged in this layout. """
-        return self.wrapper_boxes
-
-
     def get_union_box(self):
         """ Returns the union Box for this layout.
         @return: The union Box for this layout. """
@@ -175,12 +165,6 @@ class FiniteLayout(object): # 2D only
         """ Returns the current viewport Box.
         @return: The current viewport Box. """
         return self.viewport_box
-
-
-    def get_orientation(self):
-        """ Returns the orientation for this layout.
-        @return: The orientation for this layout. """
-        return self.orientation
 
 
     def set_orientation(self, orientation):

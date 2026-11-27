@@ -1,14 +1,13 @@
 """thumbbar.py - Thumbnail sidebar for main window."""
 
-import urllib.request, urllib.parse, urllib.error
-from gi.repository import GObject, Gdk, GdkPixbuf, Gtk
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 import cairo
 
 from mcomix.preferences import prefs
 from mcomix import image_tools
 from mcomix import tools
-from mcomix import constants
 from mcomix import thumbnail_view
+from mcomix.i18n import _
 
 
 class ThumbnailSidebar(Gtk.ScrolledWindow):
@@ -101,10 +100,6 @@ class ThumbnailSidebar(Gtk.ScrolledWindow):
             self._thumbnail_page_treeviewcolumn.set_fixed_width(w)
         self._thumbnail_page_treeviewcolumn.set_visible(visible)
 
-    def get_width(self):
-        """Return the width in pixels of the ThumbnailSidebar."""
-        return self.size_request().width
-
     def show(self, *args):
         """Show the ThumbnailSidebar."""
         self.load_thumbnails()
@@ -121,7 +116,7 @@ class ThumbnailSidebar(Gtk.ScrolledWindow):
         self._loaded = False
         self._treeview.stop_update()
         self._thumbnail_liststore.clear()
-        self._currently_selected_page = 0
+        self._currently_selected_row = 0
 
     def resize(self):
         """Reload the thumbnails with the size specified by in the
@@ -231,8 +226,11 @@ class ThumbnailSidebar(Gtk.ScrolledWindow):
 
         selected = self._get_selected_row()
         path = self._window.imagehandler.get_path_to_page(selected + 1)
-        uri = 'file://localhost' + urllib.request.pathname2url(path)
-        selection.set_uris([uri])
+        # Archive pages might be read on demand: write the file to disk.
+        if self._window.filehandler.materialize([path]):
+            self._window.osd.show(_('Could not extract the selected page.'))
+            return
+        selection.set_uris([GLib.filename_to_uri(path, None)])
 
     def _drag_begin(self, treeview, context):
         """We hook up on drag_begin events so that we can set the hotspot

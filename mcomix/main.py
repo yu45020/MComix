@@ -1,12 +1,10 @@
 """main.py - Main window."""
 
-import sys
 import math
 import os
 import shutil
-import threading
 
-from gi.repository import GObject, Gdk, Gtk, GLib
+from gi.repository import Gdk, GdkPixbuf, Gtk, GLib
 
 from mcomix import constants
 from mcomix import cursor_handler
@@ -24,12 +22,12 @@ from mcomix import ui
 from mcomix import slideshow
 from mcomix import status
 from mcomix import thumbbar
+from mcomix import upscale
 from mcomix import clipboard
 from mcomix import pageselect
 from mcomix import osd
 from mcomix import keybindings
 from mcomix import zoom
-from mcomix import bookmark_backend
 from mcomix import message_dialog
 from mcomix import callback
 from mcomix.library import backend, main_dialog
@@ -40,7 +38,7 @@ from mcomix import log
 from mcomix.transform import Matrix, Transform
 from mcomix.i18n import _
 
-from typing import List
+from typing import Any, List, Optional, Tuple, Union, cast
 
 
 class MainWindow(Gtk.Window):
@@ -51,7 +49,7 @@ class MainWindow(Gtk.Window):
 
     def __init__(self, fullscreen=False, is_slideshow=slideshow,
             show_library=False, manga_mode=False, double_page=False,
-            zoom_mode=None, open_path=None, open_page=1):
+            zoom_mode=None, open_path=None, open_page=0, open_entry=''):
         super(MainWindow, self).__init__(Gtk.WindowType.TOPLEVEL)
 
         # ----------------------------------------------------------------
@@ -62,18 +60,15 @@ class MainWindow(Gtk.Window):
         self.is_manga_mode = False
         self.previous_size = (None, None)
         self.was_out_of_focus = False
-        #: Used to remember if changing to fullscreen enabled 'Hide all'
-        self.hide_all_forced = False
-        # Remember last scroll destination.
-        self._last_scroll_destination = constants.SCROLL_TO_START
+        # Set once shutdown starts; later quit requests are ignored.
+        self._terminating = False
 
         self.layout = layout.create_dummy_layout()
         self.transforms: List[Matrix] = []
-        self._spacing = prefs['space between two pages']
         self._waiting_for_redraw = False
-
-        # XXX transitional(kept for osd.py)
-        self._image_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 2)
+        self._redraw_scroll_to: Optional[int] = None
+        self._pending_decode_redraw = None
+        self._pending_notice = ''
 
         self._main_layout = Gtk.Layout()
         # Wrap main layout into an event box so
@@ -93,6 +88,12 @@ class MainWindow(Gtk.Window):
         self.filehandler.file_opened += self._on_file_opened
         self.imagehandler = image_handler.ImageHandler(self)
         self.imagehandler.page_available += self._page_available
+        self.imagehandler.page_cached += self._page_cached
+        self.imagehandler.upscaler.upscaled += self._page_upscaled
+        self.imagehandler.upscaler.rendered_ready += self._page_rendered
+        self.imagehandler.upscaler.model_failed += self._upscale_model_failed
+        #: Upscaler keys of the displayed pages
+        self._upscale_keys: List[upscale.PageKey] = []
         self.thumbnailsidebar = thumbbar.ThumbnailSidebar(self)
 
         self.statusbar = status.Statusbar()
@@ -110,6 +111,9 @@ class MainWindow(Gtk.Window):
         self.actiongroup = self.uimanager.get_action_groups()[0]
 
         self.images = [Gtk.Image(), Gtk.Image()] # XXX limited to at most 2 pages
+        image_overlay = self._create_image_overlay()
+        playback: Any = self.imagehandler.animations
+        playback.notice_changed += self._animation_notice_changed
 
         # ----------------------------------------------------------------
         # Setup
@@ -140,7 +144,7 @@ class MainWindow(Gtk.Window):
         table.attach(self.thumbnailsidebar, 0, 1, 2, 5, Gtk.AttachOptions.FILL,
             Gtk.AttachOptions.FILL|Gtk.AttachOptions.EXPAND, 0, 0)
 
-        table.attach(self._event_box, 1, 2, 2, 3, Gtk.AttachOptions.FILL|Gtk.AttachOptions.EXPAND,
+        table.attach(image_overlay, 1, 2, 2, 3, Gtk.AttachOptions.FILL|Gtk.AttachOptions.EXPAND,
             Gtk.AttachOptions.FILL|Gtk.AttachOptions.EXPAND, 0, 0)
         table.attach(self._scroll[constants.PageAxis.HEIGHT], 2, 3, 2, 3, Gtk.AttachOptions.FILL|Gtk.AttachOptions.SHRINK,
             Gtk.AttachOptions.FILL|Gtk.AttachOptions.SHRINK, 0, 0)
@@ -250,7 +254,6 @@ class MainWindow(Gtk.Window):
         self.connect('focus-out-event', self.lost_focus)
         self.connect('delete_event', self.close_program)
         self.connect('key_press_event', self._event_handler.key_press_event)
-        self.connect('key_release_event', self._event_handler.key_release_event)
         self.connect('configure_event', self._event_handler.resize_event)
         self.connect('window-state-event', self._event_handler.window_state_event)
 
@@ -276,18 +279,7 @@ class MainWindow(Gtk.Window):
             toggleaction.set_active(True)
 
 
-        if prefs['previous quit was quit and save']:
-            fileinfo = self.filehandler.read_fileinfo_file()
-
-            if fileinfo != None:
-
-                open_path = fileinfo[0]
-                open_page = fileinfo[1] + 1
-
-        prefs['previous quit was quit and save'] = False
-
-        if open_path is not None:
-            self.filehandler.open_file(open_path)
+        self._open_startup_file(open_path, open_page, open_entry)
 
         if is_slideshow:
             self.actiongroup.get_action('slideshow').activate()
@@ -303,6 +295,32 @@ class MainWindow(Gtk.Window):
                 self.cursor_handler.refresh()
             Gtk.main_do_event(event)
         Gdk.event_handler_set(_on_event)
+
+    def _create_image_overlay(self) -> Any:
+        notice = Gtk.InfoBar()
+        notice.set_message_type(Gtk.MessageType.INFO)
+        notice.set_valign(Gtk.Align.START)
+        label = Gtk.Label(label=_(
+            'Animation paused: memory limit reached. Reduce the window size '
+            'or increase the animation cache limit.'))
+        label.set_line_wrap(True)
+        label.set_max_width_chars(60)
+        notice.get_content_area().add(label)
+        notice.add_button(_('Open settings'), Gtk.ResponseType.ACCEPT)
+        notice.connect('response', lambda widget, response:
+                       self.actiongroup.get_action('preferences').activate())
+        notice.show_all()
+        notice.set_no_show_all(True)
+        notice.hide()
+        self._animation_notice = notice
+        overlay = Gtk.Overlay()
+        overlay.add(self._event_box)
+        overlay.add_overlay(notice)
+        overlay.show()
+        return overlay
+
+    def _animation_notice_changed(self, limited: bool) -> None:
+        self._animation_notice.set_visible(limited)
 
     def gained_focus(self, *args):
         def _delayed_unset_out_of_focus(_):
@@ -320,19 +338,15 @@ class MainWindow(Gtk.Window):
     def lost_focus(self, *args):
         self.was_out_of_focus = True
 
-        # If the user presses CTRL for a keyboard shortcut, e.g. to
-        # open the library, key_release_event isn't fired and force_single_step
-        # isn't properly unset.
-        self.imagehandler.force_single_step = False
-
     def draw_image(self, scroll_to=None):
         """Draw the current pages and update the titlebar and statusbar.
         """
-        # FIXME: what if scroll_to is different?
+        # A queued redraw uses the latest requested scroll position.
+        if scroll_to is not None:
+            self._redraw_scroll_to = scroll_to
         if not self._waiting_for_redraw:  # Don't stack up redraws.
             self._waiting_for_redraw = True
-            GLib.idle_add(self._draw_image, scroll_to,
-                             priority=GLib.PRIORITY_HIGH_IDLE)
+            GLib.idle_add(self._draw_image, priority=GLib.PRIORITY_HIGH_IDLE)
 
     def _update_toggle_preference(self, preference, toggleaction):
         ''' Update "toggle" widget corresponding <preference>.
@@ -376,23 +390,39 @@ class MainWindow(Gtk.Window):
                 if should_be_visible != widget.get_visible():
                     (widget.show if should_be_visible else widget.hide)()
 
-    def _draw_image(self, scroll_to):
+    def _draw_image(self) -> bool:
+        """Run one redraw, allowing later requests even if rendering fails."""
+        scroll_to, self._redraw_scroll_to = self._redraw_scroll_to, None
+        try:
+            self._draw_image_impl(scroll_to)
+        except Exception:
+            log.error(_('Could not draw page'), exc_info=True)
+        finally:
+            self._waiting_for_redraw = False
+        return False
+
+    def _draw_image_impl(self, scroll_to: Optional[int]) -> None:
 
         self._update_toggles_visibility()
 
         self.osd.clear()
 
         if not self.filehandler.file_loaded:
+            self.imagehandler.stop_animations()
+            self._pending_decode_redraw = None
             self._clear_main_area()
-            self._waiting_for_redraw = False
-            return False
+            return
 
+        pixbuf_list = None
         if self.imagehandler.page_is_available():
+            pixbuf_count = 2 if self.displayed_double() else 1
+            pixbuf_list = self.imagehandler.get_pixbufs(pixbuf_count, block=False)
+        if pixbuf_list is not None:
+            self._pending_decode_redraw = None
             distribution_axis = constants.DISTRIBUTION_AXIS
             alignment_axis = constants.ALIGNMENT_AXIS
-            pixbuf_count = 2 if self.displayed_double() else 1 # XXX limited to at most 2 pages
-            pixbuf_list = list(self.imagehandler.get_pixbufs(pixbuf_count))
-            do_not_transform = [image_tools.is_animation(x) for x in pixbuf_list]
+            do_not_transform = [isinstance(x, GdkPixbuf.PixbufAnimation)
+                                for x in pixbuf_list]
             size_list = [[pixbuf.get_width(), pixbuf.get_height()]
                          for pixbuf in pixbuf_list]
 
@@ -437,37 +467,88 @@ class MainWindow(Gtk.Window):
             if prefs['horizontal flip'] and not tools.rotation_swaps_axes(rotation):
                 orientation = tools.vector_opposite(orientation)
 
+            def zoomed_size(viewport: tuple) -> tuple:
+                sizes, distorted = cast(Tuple[List[List[int]], List[bool]], self.zoom.get_zoomed_size(
+                    size_list, viewport, distribution_axis, do_not_transform,
+                    prefs['double page autoresize'] in (
+                        constants.DOUBLE_PAGE_AUTORESIZE_SIZE,
+                        constants.DOUBLE_PAGE_AUTORESIZE_FIT_SIZE),
+                    prefs['double page autoresize'] == constants.DOUBLE_PAGE_AUTORESIZE_FIT_SIZE))
+                for index, pixbuf in enumerate(pixbuf_list):
+                    if getattr(pixbuf, 'webp_animation', None) is not None:
+                        if not prefs['enlarge animated webp']:
+                            sizes[index] = list(image_tools.get_fitting_size(
+                                size_list[index], sizes[index], scale_up=False))
+                            distorted[index] = False
+                        limit = cast(int, prefs['animated webp max size'])
+                        if limit > 0 and max(sizes[index]) > limit:
+                            sizes[index] = list(image_tools.get_fitting_size(
+                                size_list[index], tuple(min(edge, limit) for edge in sizes[index]), scale_up=True))
+                            distorted[index] = False
+                return sizes, distorted
+
             self.layout = layout.FiniteLayout.create_finite_layout(
-                pixbuf_count, orientation, self._spacing, distribution_axis,
+                pixbuf_count, orientation, prefs['space between two pages'], distribution_axis,
                 alignment_axis, self._show_scrollbars, self.get_visible_area_size,
-                lambda zoom_dummy_size: self.zoom.get_zoomed_size(size_list, zoom_dummy_size,
-                distribution_axis, do_not_transform,
-                prefs['double page autoresize'] in (constants.DOUBLE_PAGE_AUTORESIZE_SIZE,
-                constants.DOUBLE_PAGE_AUTORESIZE_FIT_SIZE),
-                prefs['double page autoresize'] == constants.DOUBLE_PAGE_AUTORESIZE_FIT_SIZE))
+                zoomed_size)
             content_boxes = self.layout.get_content_boxes()
             scaled_sizes = list(map(box.Box.get_size, content_boxes))
 
+            upscaler = self.imagehandler.upscaler
+            first_page = self.imagehandler.get_current_page()
+            animations = self.imagehandler.animations
+            animations.configure([
+                (i, (self.imagehandler._page_generation, first_page + i), pixbuf,
+                 (tuple(scaled_sizes[i]), rotation_list[i],
+                  prefs['horizontal flip'], prefs['vertical flip'],
+                  self.enhancer.settings_key(), prefs['scaling quality'],
+                  prefs['checkered bg for transparent images']))
+                for i, pixbuf in enumerate(pixbuf_list)
+                if getattr(pixbuf, 'webp_animation', None) is not None])
+            self._upscale_keys = [self._upscale_key(first_page + i)
+                                  for i in range(pixbuf_count)]
+            next_pages = range(first_page + pixbuf_count, first_page + 2 * pixbuf_count)
+            upscaler.set_wanted(self._upscale_keys + list(map(self._upscale_key, next_pages)))
             self.transforms = [Transform.ID] * pixbuf_count
             for i in range(pixbuf_count):
                 if do_not_transform[i]:
                     continue
-                pixbuf_list[i] = image_tools.fit_pixbuf_to_rectangle(
-                    pixbuf_list[i], scaled_sizes[i], rotation_list[i])
                 self.transforms[i] += Transform.from_rotation(rotation_list[i]) # FIXME also include scales
+                displayed = animations.displayed(i)
+                if displayed is not None:
+                    pixbuf_list[i] = displayed
+                    continue
+                if getattr(pixbuf_list[i], 'webp_animation', None) is not None:
+                    upscaled = image_tools.fit_pixbuf_to_rectangle(
+                        pixbuf_list[i], scaled_sizes[i], rotation_list[i])
+                else:
+                    upscaled = upscaler.render(self._upscale_keys[i], pixbuf_list[i],
+                                               scaled_sizes[i], rotation_list[i])
+                    if upscaled is None:
+                        upscaled = self.imagehandler.render_conventional(
+                            pixbuf_list[i], scaled_sizes[i], rotation_list[i])
+                pixbuf_list[i] = upscaled
+            for page in next_pages:
+                self._prefetch_upscaling(page)
 
             for i in range(pixbuf_count):
                 if do_not_transform[i]:
                     continue
+                already_rendered = animations.displayed(i) is not None
                 if prefs['horizontal flip']:
-                    pixbuf_list[i] = image_tools.flip_pixbuf(pixbuf_list[i], 0)
+                    if not already_rendered:
+                        pixbuf_list[i] = image_tools.flip_pixbuf(pixbuf_list[i], 0)
                     self.transforms[i] += Transform.from_flips(True, False)
                 if prefs['vertical flip']:
-                    pixbuf_list[i] = image_tools.flip_pixbuf(pixbuf_list[i], 1)
+                    if not already_rendered:
+                        pixbuf_list[i] = image_tools.flip_pixbuf(pixbuf_list[i], 1)
                     self.transforms[i] += Transform.from_flips(False, True)
-                pixbuf_list[i] = self.enhancer.enhance(pixbuf_list[i])
+                if not already_rendered:
+                    pixbuf_list[i] = self.enhancer.enhance(pixbuf_list[i])
 
             for i in range(pixbuf_count):
+                if i in animations.pages:
+                    animations.pages[i].display = pixbuf_list[i]
                 image_tools.set_from_pixbuf(self.images[i], pixbuf_list[i])
 
             scales = tuple(map(lambda x, y: math.sqrt(tools.div(
@@ -489,48 +570,53 @@ class MainWindow(Gtk.Window):
             if smartthumbbg:
                 self.thumbnailsidebar.change_thumbnail_background_color(bg_colour)
 
-            self._main_layout.get_bin_window().freeze_updates()
+            bin_window = self._main_layout.get_bin_window()
+            bin_window.freeze_updates()
+            try:
+                self._main_layout.set_size(*(self.layout.get_union_box().get_size()))
+                for i in range(pixbuf_count):
+                    self._main_layout.move(self.images[i],
+                        *content_boxes[i].get_position())
 
-            self._main_layout.set_size(*(self.layout.get_union_box().get_size()))
-            for i in range(pixbuf_count):
-                self._main_layout.move(self.images[i],
-                    *content_boxes[i].get_position())
+                for i in range(pixbuf_count):
+                    self.images[i].show()
+                for i in range(pixbuf_count, len(self.images)):
+                    self.images[i].hide()
 
-            for i in range(pixbuf_count):
-                self.images[i].show()
-            for i in range(pixbuf_count, len(self.images)):
-                self.images[i].hide()
-
-            # Reset orientation so scrolling behaviour is sane.
-            if self.is_manga_mode:
-                self.layout.set_orientation(constants.MANGA_ORIENTATION)
-            else:
-                self.layout.set_orientation(constants.WESTERN_ORIENTATION)
-
-            if scroll_to is not None:
-                destination = (scroll_to,) * 2
-                if constants.SCROLL_TO_START == scroll_to:
-                    index = constants.FIRST_INDEX
-                elif constants.SCROLL_TO_END == scroll_to:
-                    index = constants.LAST_INDEX
+                # Reset orientation so scrolling behaviour is sane.
+                if self.is_manga_mode:
+                    self.layout.set_orientation(constants.MANGA_ORIENTATION)
                 else:
-                    index = None
-                self.scroll_to_predefined(destination, index)
+                    self.layout.set_orientation(constants.WESTERN_ORIENTATION)
 
-            self._main_layout.get_bin_window().thaw_updates()
+                if scroll_to is not None:
+                    destination = (scroll_to,) * 2
+                    if constants.SCROLL_TO_START == scroll_to:
+                        index = constants.FIRST_INDEX
+                    elif constants.SCROLL_TO_END == scroll_to:
+                        index = constants.LAST_INDEX
+                    else:
+                        index = None
+                    self.scroll_to_predefined(destination, index)
+            finally:
+                bin_window.thaw_updates()
+            # The OSD paints at the scroll position, so wait for the layout.
+            if self._pending_notice:
+                self.statusbar.set_message(self._pending_notice)
+                self.osd.show(self._pending_notice)
+                self._pending_notice = ''
         else:
-            # Save scroll destination for when the page becomes available.
-            self._last_scroll_destination = scroll_to
+            self.imagehandler.stop_animations()
+            # A decoded wide current page can become drawable before its
+            # prospective partner is extracted. Track both kinds of wait.
+            self._pending_decode_redraw = (self.imagehandler._page_generation,
+                                           self.imagehandler.get_current_page(), scroll_to)
             # If the pixbuf for the current page(s) isn't available,
             # hide all images to clear any old pixbufs.
             # XXX How about calling self._clear_main_area?
             for i in range(len(self.images)):
                 self.images[i].hide()
             self._show_scrollbars([False] * len(self._scroll))
-
-        self._waiting_for_redraw = False
-
-        return False
 
     def _update_page_information(self) -> None:
         """ Updates the window with information that can be gathered
@@ -574,12 +660,69 @@ class MainWindow(Gtk.Window):
         current_page = self.imagehandler.get_current_page()
         nb_pages = 2 if self.displayed_double() else 1
         if current_page <= page < (current_page + nb_pages):
-            self.draw_image(scroll_to=self._last_scroll_destination)
+            pending = self._pending_decode_redraw
+            if pending is not None and pending[:2] == (self.imagehandler._page_generation, current_page):
+                scroll_to = pending[2]
+            else:
+                # No redraw is waiting for this page: keep the reader's position.
+                scroll_to = None
+            self.draw_image(scroll_to=scroll_to)
             self._update_page_information()
 
         # Use first page as application icon when opening archives.
         if page == 1:
             self.update_icon(False)
+
+    def _page_upscaled(self, key, image):
+        """ Called when the upscaler has processed a page. """
+        if image is not None:
+            self._page_rendered(key)
+
+    def _page_rendered(self, key: upscale.PageKey) -> None:
+        """Refresh a visible neural rendering without replacing pending navigation."""
+        if not self.filehandler.file_loaded or self._pending_decode_redraw is not None:
+            return
+        current = self.imagehandler.get_current_page()
+        count = 2 if self.displayed_double() else 1
+        if key in self._upscale_keys and key in [self._upscale_key(current + i) for i in range(count)]:
+            self.draw_image()
+
+    def _page_cached(self, page):
+        """ Called when a page has been decoded. """
+        if not self.filehandler.file_loaded:
+            return
+        current = self.imagehandler.get_current_page()
+        pending = self._pending_decode_redraw
+        if pending is not None and pending[:2] == (self.imagehandler._page_generation, current):
+            if current <= page <= current + 1:
+                self.draw_image(scroll_to=pending[2])
+                self._update_page_information()
+        # Prefetch the next pages, also when they are decoded after the
+        # current ones have been drawn.
+        first_page = self.imagehandler.get_current_page() + len(self._upscale_keys)
+        if first_page <= page < first_page + len(self._upscale_keys):
+            self._prefetch_upscaling(page)
+
+    def _upscale_key(self, page):
+        return self.imagehandler.upscaler.page_key(self.imagehandler.get_path_to_page(page))
+
+    def _prefetch_upscaling(self, page):
+        """ Requests neural upscaling of <page> in the background, if it is
+        decoded. """
+        pixbuf = self.imagehandler.get_cached_pixbuf(page)
+        if pixbuf is not None:
+            self.imagehandler.upscaler.prefetch(self._upscale_key(page), pixbuf)
+
+    def show_notice(self, text: str) -> None:
+        """Show text in the status bar and OSD once the page is drawn.
+
+        Drawing clears the OSD and replaces the status bar text, so a notice
+        given while a book opens would vanish before the user saw it.
+        """
+        self._pending_notice = text
+
+    def _upscale_model_failed(self, path, message):
+        self.osd.show(_('Neural upscaling disabled: %s') % message)
 
     def _on_file_opened(self):
         self.uimanager.set_sensitivities()
@@ -625,34 +768,31 @@ class MainWindow(Gtk.Window):
         self.slideshow.update_delay()
 
     def next_book(self):
-        archive_open = self.filehandler.archive_type is not None
-        next_archive_opened = False
-        if (self.slideshow.is_running() and \
-            prefs['slideshow can go to next archive']) or \
-           prefs['auto open next archive']:
-            next_archive_opened = self.filehandler._open_next_archive()
-
-        # If "Auto open next archive" is disabled, do not go to the next
-        # directory if current file was an archive.
-        if not next_archive_opened and \
-           prefs['auto open next directory'] and \
-           (not archive_open or prefs['auto open next archive']):
-            self.filehandler.open_next_directory()
+        self._change_book(True)
 
     def previous_book(self):
-        archive_open = self.filehandler.archive_type is not None
-        previous_archive_opened = False
-        if (self.slideshow.is_running() and \
-            prefs['slideshow can go to next archive']) or \
-            prefs['auto open next archive']:
-            previous_archive_opened = self.filehandler._open_previous_archive()
+        self._change_book(False)
 
-        # If "Auto open next archive" is disabled, do not go to the previous
+    def _change_book(self, forward: bool) -> None:
+        archive_open = self.filehandler.archive_type is not None
+        archive_opened = False
+        if (self.slideshow.is_running() and
+                prefs['slideshow can go to next archive']) or \
+                prefs['auto open next archive']:
+            if forward:
+                archive_opened = self.filehandler._open_next_archive()
+            else:
+                archive_opened = self.filehandler._open_previous_archive()
+
+        # If "Auto open next archive" is disabled, do not change
         # directory if current file was an archive.
-        if not previous_archive_opened and \
-            prefs['auto open next directory'] and \
-            (not archive_open or prefs['auto open next archive']):
-            self.filehandler.open_previous_directory()
+        if not archive_opened and \
+                prefs['auto open next directory'] and \
+                (not archive_open or prefs['auto open next archive']):
+            if forward:
+                self.filehandler.open_next_directory()
+            else:
+                self.filehandler.open_previous_directory()
 
     def flip_page(self, step, single_step=False):
 
@@ -723,6 +863,7 @@ class MainWindow(Gtk.Window):
 
     def change_double_page(self, toggleaction):
         prefs['default double page'] = toggleaction.get_active()
+        self.imagehandler.do_cacheing()
         self._update_page_information()
         self.draw_image()
 
@@ -824,8 +965,6 @@ class MainWindow(Gtk.Window):
 
     def is_scrollable(self):
         """ Returns True if the current images do not fit into the viewport. """
-        if self.layout is None:
-            return False
         return not all(tools.smaller_or_equal(self.layout.get_union_box().get_size(),
             self.get_visible_area_size()))
 
@@ -834,11 +973,8 @@ class MainWindow(Gtk.Window):
         a new page and False otherwise."""
         return self._event_handler._scroll_with_flipping(x, y)
 
-    def scroll(self, x, y, bound=None):
-        """Scroll <x> px horizontally and <y> px vertically. If <bound> is
-        'first' or 'second', we will not scroll out of the first or second
-        page respectively (dependent on manga mode). The <bound> argument
-        only makes sense in double page mode.
+    def scroll(self, x, y):
+        """Scroll <x> px horizontally and <y> px vertically.
 
         Return True if call resulted in new adjustment values, False
         otherwise.
@@ -850,22 +986,11 @@ class MainWindow(Gtk.Window):
 
         hadjust_upper = max(0, self._hadjust.get_upper() - visible_width)
         vadjust_upper = max(0, self._vadjust.get_upper() - visible_height)
-        hadjust_lower = 0
-
-        if bound is not None and self.is_manga_mode:
-            bound = {'first': 'second', 'second': 'first'}[bound]
-
-        if bound == 'first':
-            hadjust_upper = max(0, hadjust_upper -
-                self.images[1].size_request().width - 2) # XXX transitional(double page limitation)
-
-        elif bound == 'second':
-            hadjust_lower = self.images[0].size_request().width + 2 # XXX transitional(double page limitation)
 
         new_hadjust = old_hadjust + x
         new_vadjust = old_vadjust + y
 
-        new_hadjust = max(hadjust_lower, new_hadjust)
+        new_hadjust = max(0, new_hadjust)
         new_vadjust = max(0, new_vadjust)
 
         new_hadjust = min(hadjust_upper, new_hadjust)
@@ -897,6 +1022,7 @@ class MainWindow(Gtk.Window):
         """Clear the currently displayed data (i.e. "close" the file)."""
         self.set_title(constants.APPNAME)
         self.statusbar.set_message('')
+        self._pending_notice = ''
         self.draw_image()
 
     def _clear_main_area(self):
@@ -913,7 +1039,7 @@ class MainWindow(Gtk.Window):
         """Return True if two pages are currently displayed."""
         return (self.imagehandler.get_current_page() and
                 prefs['default double page'] and
-                not self.imagehandler.get_virtual_double_page() and
+                not self.imagehandler.get_virtual_double_page(cached_only=True) and
                 self.imagehandler.get_current_page() != self.imagehandler.get_number_of_pages())
 
     def get_visible_area_size(self):
@@ -935,16 +1061,6 @@ class MainWindow(Gtk.Window):
 
         return tuple(dimensions)
 
-    def get_layout_pointer_position(self):
-        """Return a 2-tuple with the x and y coordinates of the pointer
-        on the main layout area, relative to the layout.
-        """
-        x, y = self._main_layout.get_pointer()
-        x += self._hadjust.get_value()
-        y += self._vadjust.get_value()
-
-        return (x, y)
-
     def set_cursor(self, mode):
         """Set the cursor on the main layout area to <mode>. You should
         probably use the cursor_handler instead of using this method
@@ -963,7 +1079,6 @@ class MainWindow(Gtk.Window):
                 title += ','
         title += ' / %d]  %s' % (self.imagehandler.get_number_of_pages(),
             self.imagehandler.get_pretty_current_filename())
-        title = i18n.to_unicode(title)
 
         if self.slideshow.is_running():
             title = '[%s] %s' % (_('SLIDESHOW'), title)
@@ -976,8 +1091,6 @@ class MainWindow(Gtk.Window):
         """
         colour = colour[:3]
         self._event_box.modify_bg(Gtk.StateType.NORMAL, Gdk.Color(*colour))
-        if prefs['thumbnail bg uses main colour']:
-            self.thumbnailsidebar.change_thumbnail_background_color(prefs['bg colour'][:3])
         self._bg_colour = colour
 
     def get_bg_colour(self):
@@ -998,12 +1111,12 @@ class MainWindow(Gtk.Window):
 
             if self.filehandler.archive_type is not None:
                 # Prepend the archive base name to the filename being displayed
-                archive_name = self.filehandler.get_pretty_current_filename()
+                archive_name = self.imagehandler.get_pretty_current_filename()
                 file_name = (
                     os.path.splitext(archive_name)[0] + '_' + file_name)
 
             target_dir = prefs['path of last saved in filechooser'] + os.sep
-            suggest_name = i18n.to_unicode(file_name)
+            suggest_name = file_name
             attempt = 1
             while os.path.exists(target_dir + suggest_name):
                 suggest_name = tools.append_number_to_filename(
@@ -1023,9 +1136,15 @@ class MainWindow(Gtk.Window):
             if save_dialog.run() == Gtk.ResponseType.ACCEPT:
                 target = save_dialog.get_filename()
                 if target:
-                    target = i18n.to_unicode(target)
                     try:
-                        shutil.copy2(file_path, target)
+                        if self.filehandler.archive_type is not None:
+                            # Archive pages might be read on demand. Read
+                            # first: opening <target> truncates it.
+                            data = self.filehandler.read_file(file_path)
+                            with open(target, 'wb') as fp:
+                                fp.write(data)
+                        else:
+                            shutil.copy2(file_path, target)
                     except Exception as e:
                         log.warning(e)
 
@@ -1063,15 +1182,17 @@ class MainWindow(Gtk.Window):
                 if not next_opened:
                     self.filehandler.close_file()
 
+                self.filehandler.wait_for_file_release(current_file)
                 if os.path.isfile(current_file):
                     os.unlink(current_file)
             else:
                 if self.imagehandler.get_number_of_pages() > 1:
-                    # Open the next/previous file
+                    # Open the next/previous file: one page, so that a double
+                    # step never leaves the book.
                     if self.imagehandler.get_current_page() >= self.imagehandler.get_number_of_pages():
-                        self.flip_page(-1)
+                        self.flip_page(-1, single_step=True)
                     else:
-                        self.flip_page(+1)
+                        self.flip_page(+1, single_step=True)
                     # Unlink the desired file
                     if os.path.isfile(current_file):
                         os.unlink(current_file)
@@ -1109,14 +1230,44 @@ class MainWindow(Gtk.Window):
         """ Minimizes the MComix window. """
         self.iconify()
 
-    def write_config_files(self):
+    def _open_startup_file(self, open_path: Optional[Union[str, List[str]]],
+                           open_page: int = 0, open_entry: str = '') -> None:
+        """Prefer explicit paths, then Save and quit, then automatic restore.
 
-        self.filehandler.write_fileinfo_file()
-        preferences.write_preferences_file()
-        bookmark_backend.BookmarksStore.write_bookmarks_file()
+        An ordinary open uses page zero and the history prompt policy. Saved
+        startup positions are explicit pages, even when history is disabled.
+        open_page and open_entry (command line) apply only to open_path.
+        """
+        restore_saved = prefs['previous quit was quit and save']
+        prefs['previous quit was quit and save'] = False
+        open_image = ''
+        if open_path is None and restore_saved:
+            fileinfo = self.filehandler.read_fileinfo_file()
+            if fileinfo is not None and os.path.exists(fileinfo[0]):
+                open_path, page_index, open_image = fileinfo
+                open_page = page_index + 1
+        last_path = prefs['path to last file']
+        if open_path is None and prefs['auto load last file'] and \
+                isinstance(last_path, str) and os.path.exists(last_path):
+            open_path = last_path
+            saved_page = prefs['page of last file']
+            open_page = saved_page if type(saved_page) is int and saved_page > 0 else 1
+            saved_image = prefs['image of last file']
+            open_image = saved_image if isinstance(saved_image, str) else ''
+        if open_path is not None:
+            self.filehandler.open_file(open_path, start_page=open_page,
+                                       start_image=open_image, start_entry=open_entry)
 
-        # Write keyboard accelerator map
-        keybindings.keybinding_manager(self).save()
+    def write_config_files(self) -> None:
+        """Write each config file on its own, so one failure loses only it.
+        Bookmarks are saved by each change."""
+        for write in (self.filehandler.write_fileinfo_file,
+                      preferences.write_preferences_file,
+                      keybindings.keybinding_manager(self).save):
+            try:
+                write()
+            except Exception as error:
+                log.error(_('! Could not save settings: %s'), error)
 
     def save_and_terminate_program(self, *args):
         prefs['previous quit was quit and save'] = True
@@ -1150,7 +1301,6 @@ class MainWindow(Gtk.Window):
         return True
 
     def update_space(self):
-        self._spacing = prefs['space between two pages']
         self.draw_image()
 
     def close_program(self, *args):
@@ -1158,8 +1308,33 @@ class MainWindow(Gtk.Window):
             self.save_window_geometry()
         self.terminate_program()
 
-    def terminate_program(self):
-        """Run clean-up tasks and exit the program."""
+    def terminate_program(self) -> None:
+        """Fence new opens and wait for an active open before cleanup."""
+        if self._terminating:
+            return
+        self._terminating = True
+        self.filehandler.begin_shutdown(self._terminate_program)
+        # An active open may be inside Gtk.Dialog.run(). Unwind its modal
+        # loop now, so the deferred cleanup can run when that open returns.
+        self._close_transient_dialogs()
+
+    def _close_transient_dialogs(self) -> None:
+        """Destroy owned dialogs, stopping their workers before file cleanup."""
+        resume_dialog = self.filehandler._resume_dialog
+        for dialog in Gtk.Window.list_toplevels():
+            # FileHandler has sent CANCEL; its MessageDialog.run() still
+            # reads the remember checkbox before destroying itself.
+            if dialog is resume_dialog:
+                continue
+            parent = dialog.get_transient_for()
+            while parent is not None and parent is not self:
+                parent = parent.get_transient_for()
+            if parent is self:
+                dialog.destroy()
+
+    def _terminate_program(self) -> None:
+        """Stop owned workers before releasing their files and database."""
+        self._close_transient_dialogs()
 
         self.hide()
 
@@ -1167,28 +1342,27 @@ class MainWindow(Gtk.Window):
             Gtk.main_quit()
 
         if prefs['auto load last file'] and self.filehandler.file_loaded:
-            prefs['path to last file'] = self.imagehandler.get_real_path()
-            prefs['page of last file'] = self.imagehandler.get_current_page()
+            (prefs['path to last file'], prefs['page of last file'],
+             prefs['image of last file']) = self.filehandler.get_book_position()
 
         else:
             prefs['path to last file'] = ''
             prefs['page of last file'] = 1
-
-        if prefs['hide all'] and self.hide_all_forced and self.fullscreen:
-            prefs['hide all'] = False
+            prefs['image of last file'] = ''
 
         self.write_config_files()
 
         self.filehandler.close_file()
+        # The upscaler outlives individual books and needs an explicit stop.
+        self.imagehandler.upscaler.stop()
         if main_dialog._dialog is not None:
             main_dialog._dialog.close()
         backend.LibraryBackend().close()
 
-        # This hack is to avoid Python issue #1856.
-        for thread in threading.enumerate():
-            if thread is not threading.currentThread() and not isinstance(thread, threading._DummyThread):
-                log.debug('Waiting for thread %s to finish before exit', thread)
-                thread.join()
+        # Every persistent worker is stopped by its owner above. Finite
+        # non-daemon packing/deletion threads retain normal Python exit
+        # semantics; unrelated daemon jobs are not part of viewer shutdown.
+
 
 #: Main window instance
 __main_window = None

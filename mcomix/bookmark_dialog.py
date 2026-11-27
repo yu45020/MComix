@@ -32,7 +32,7 @@ class _BookmarksDialog(Gtk.Dialog):
         self.vbox.pack_start(scrolled, True, True, 0)
 
         self._liststore = Gtk.ListStore(GdkPixbuf.Pixbuf, GObject.TYPE_STRING,
-            GObject.TYPE_STRING, GObject.TYPE_STRING, GObject.TYPE_STRING, bookmark_menu_item._Bookmark)
+            GObject.TYPE_STRING, GObject.TYPE_STRING, bookmark_menu_item._Bookmark)
 
         self._treeview = Gtk.TreeView(self._liststore)
         self._treeview.set_rules_hint(True)
@@ -51,21 +51,18 @@ class _BookmarksDialog(Gtk.Dialog):
         self._icon_col = Gtk.TreeViewColumn(_('Type'), cellrenderer_pbuf)
         self._name_col = Gtk.TreeViewColumn(_('Name'), cellrenderer_text)
         self._page_col = Gtk.TreeViewColumn(_('Page'), cellrenderer_text)
-        self._path_col = Gtk.TreeViewColumn(_('Location'), cellrenderer_text)
         # TRANSLATORS: "Added" as in "Date Added"
         self._date_add_col = Gtk.TreeViewColumn(_('Added'), cellrenderer_text)
 
         self._treeview.append_column(self._icon_col)
         self._treeview.append_column(self._name_col)
         self._treeview.append_column(self._page_col)
-        self._treeview.append_column(self._path_col)
         self._treeview.append_column(self._date_add_col)
 
         self._icon_col.set_attributes(cellrenderer_pbuf, pixbuf=0)
         self._name_col.set_attributes(cellrenderer_text, text=1)
         self._page_col.set_attributes(cellrenderer_text, text=2)
-        self._path_col.set_attributes(cellrenderer_text, text=3)
-        self._date_add_col.set_attributes(cellrenderer_text, text=4)
+        self._date_add_col.set_attributes(cellrenderer_text, text=3)
         self._name_col.set_expand(True)
 
         self._liststore.set_sort_func(_BookmarksDialog._SORT_TYPE,
@@ -80,17 +77,12 @@ class _BookmarksDialog(Gtk.Dialog):
         self._icon_col.set_sort_column_id(_BookmarksDialog._SORT_TYPE)
         self._name_col.set_sort_column_id(_BookmarksDialog._SORT_NAME)
         self._page_col.set_sort_column_id(_BookmarksDialog._SORT_PAGE)
-        self._path_col.set_sort_column_id(3)
         self._date_add_col.set_sort_column_id(_BookmarksDialog._SORT_ADDED)
 
         self._icon_col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         self._name_col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         self._page_col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
-        self._path_col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         self._date_add_col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
-
-        # FIXME Hide extra columns. Needs UI controls to enable these.
-        self._path_col.set_visible(False)
 
         self.resize(600, 450)
 
@@ -100,7 +92,8 @@ class _BookmarksDialog(Gtk.Dialog):
         self._treeview.connect('key_press_event', self._key_press_event)
         self._treeview.connect('row_activated', self._bookmark_activated)
 
-        for bookmark in self._bookmarks_store.get_bookmarks():
+        self._original_order = list(self._bookmarks_store.get_bookmarks())
+        for bookmark in self._original_order:
             self._add_bookmark(bookmark)
 
         self.show_all()
@@ -117,15 +110,18 @@ class _BookmarksDialog(Gtk.Dialog):
 
         if treeiter is not None:
 
-            bookmark = self._liststore.get_value(treeiter, 5)
-            self._liststore.remove(treeiter)
+            bookmark = self._liststore.get_value(treeiter, 4)
             self._bookmarks_store.remove_bookmark(bookmark)
+            # A failed save keeps the bookmark in the store, so keep its row.
+            if bookmark not in self._bookmarks_store.get_bookmarks():
+                self._liststore.remove(treeiter)
+                self._original_order.remove(bookmark)
 
     def _bookmark_activated(self, treeview, path, view_column, *args):
         """ Open the activated bookmark. """
 
         iter = treeview.get_model().get_iter(path)
-        bookmark = treeview.get_model().get_value(iter, 5)
+        bookmark = treeview.get_model().get_value(iter, 4)
 
         self._close()
         bookmark._load()
@@ -134,15 +130,8 @@ class _BookmarksDialog(Gtk.Dialog):
         """ Custom sort function to sort to model entries based on the
         BookmarkMenuItem's fields specified in @C{user_data}. This is a list
         of field names. """
-        if iter1 == iter2:
-            return 0
-        if iter1 is None:
-            return 1
-        elif iter2 is None:
-            return -1
-
-        bookmark1 = treemodel.get_value(iter1, 5)
-        bookmark2 = treemodel.get_value(iter2, 5)
+        bookmark1 = treemodel.get_value(iter1, 4)
+        bookmark2 = treemodel.get_value(iter2, 4)
 
         for field in user_data:
             result = tools.cmp(getattr(bookmark1, field),
@@ -161,6 +150,10 @@ class _BookmarksDialog(Gtk.Dialog):
         elif response == constants.RESPONSE_REMOVE:
             self._remove_selected()
 
+        elif response == Gtk.ResponseType.DELETE_EVENT:
+            # Gtk.Dialog emits this before our delete-event handler (_close).
+            return
+
         else:
             self.destroy()
 
@@ -177,13 +170,13 @@ class _BookmarksDialog(Gtk.Dialog):
         treeiter = self._liststore.get_iter_first()
 
         while treeiter is not None:
-            bookmark = self._liststore.get_value(treeiter, 5)
+            bookmark = self._liststore.get_value(treeiter, 4)
             ordering.insert(0, bookmark)
             treeiter = self._liststore.iter_next(treeiter)
 
-        for bookmark in ordering:
-            self._bookmarks_store.remove_bookmark(bookmark)
-            self._bookmarks_store.add_bookmark(bookmark)
+        # Write and rebuild menus once, and only if the order changed.
+        if ordering != self._original_order:
+            self._bookmarks_store.reorder_bookmarks(ordering)
 
         self.destroy()
 

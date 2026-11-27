@@ -13,9 +13,9 @@
 	  a variety of container formats (including CBR, CBZ, CB7, CBT, LHA and PDF).
   </p>
   <p>
-	  MComix is a fork of the Comix project, and aims to add bug fixes and
-	  stability improvements after Comix development came to a halt in
-	  late 2009.
+	  This is a hard fork of MComix 3.2.0. It adds optional GPU neural
+	  upscaling of small pages, animated WebP playback, on-demand reading of
+	  archive pages, AVIF and SVG pages, and many bug fixes.
   </p>
  </description>
 
@@ -23,17 +23,18 @@
 
  <screenshots>
   <screenshot type="default">
-  <image>https://sourceforge.net/p/mcomix/screenshot/273797.jpg</image>
+  <image>https://raw.githubusercontent.com/yu45020/mcomix/main/docs/images/main-window.jpg</image>
   <caption>Main window</caption>
   </screenshot>
  </screenshots>
 
- <url type="homepage">https://mcomix.sourceforge.net/</url>
+ <url type="homepage">https://github.com/yu45020/mcomix</url>
+ <url type="bugtracker">https://github.com/yu45020/mcomix/issues</url>
 
  <developer id="net.sourceforge.mcomix">
   <name>The MComix Team</name>
  </developer>
- <update_contact>https://sourceforge.net/p/mcomix/bugs/</update_contact>
+ <update_contact>https://github.com/yu45020/mcomix/issues</update_contact>
 
  <provides>
   <binary>mcomix</binary>

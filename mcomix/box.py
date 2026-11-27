@@ -23,22 +23,12 @@ class Box(object):
                 str(len(self.position)) + " != " + str(len(self.size)))
 
 
-    def __str__(self):
-        """ Returns a string representation of this Box. """
-        return "{" + str(self.get_position()) + ":" + str(self.get_size()) + "}"
-
-
     def __eq__(self, other):
         """ Two Boxes are said to be equal if and only if the number of
         dimensions, the positions and the sizes of the two Boxes are equal,
         respectively. """
         return (self.get_position() == other.get_position()) and \
             (self.get_size() == other.get_size())
-
-
-    def __len__(self):
-        """ Returns the number of dimensions of this Box. """
-        return len(self.position)
 
 
     def get_size(self):
@@ -58,13 +48,6 @@ class Box(object):
         specified position.
         @return: A new Box as specified above. """
         return Box(self.get_size(), position)
-
-
-    def set_size(self, size):
-        """ Returns a new Box that has the same position as this Box and the
-        specified size.
-        @return: A new Box as specified above. """
-        return Box(size, self.get_position())
 
 
     def distance_point_squared(self, point):
@@ -88,15 +71,6 @@ class Box(object):
                 continue
             result += r * r
         return result
-
-
-    def translate(self, delta):
-        """ Returns a new Box that has the same size as this Box and a
-        translated position as specified by delta.
-        @param delta: The distance to the position of this Box.
-        @return: A new Box as specified above. """
-        return Box(self.get_size(),
-            tools.vector_add(self.get_position(), delta))
 
 
     def translate_opposite(self, delta):
@@ -178,8 +152,8 @@ class Box(object):
             box1edge = box1.get_position()[i]
             box2edge = box2.get_position()[i]
             if o < 0:
-                box1edge = box1.get_size()[i] - box1edge
-                box2edge = box2.get_size()[i] - box2edge
+                box1edge = -(box1edge + box1.get_size()[i])
+                box2edge = -(box2edge + box2.get_size()[i])
             d = box1edge - box2edge
             if d != 0:
                 return d

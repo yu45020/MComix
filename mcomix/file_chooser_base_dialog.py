@@ -3,7 +3,9 @@
 import os
 import mimetypes
 import fnmatch
-from gi.repository import Gtk, Pango
+import threading
+from typing import Optional
+from gi.repository import Gtk, Pango, GLib
 
 from mcomix.preferences import prefs
 from mcomix import image_tools
@@ -39,6 +41,11 @@ class _BaseFileChooserDialog(Gtk.Dialog):
     def __init__(self, action=Gtk.FileChooserAction.OPEN):
         self._action = action
         self._destroyed = False
+        self._preview_generation = 0
+        self._preview_lock = threading.Lock()
+        self._preview_pending = None
+        self._preview_worker = None
+        self._preview_thumbnailer = None
 
         if action == Gtk.FileChooserAction.OPEN:
             title = _('Open')
@@ -59,6 +66,7 @@ class _BaseFileChooserDialog(Gtk.Dialog):
         self.set_border_width(4)
         self.filechooser.set_border_width(6)
         self.connect('response', self._response)
+        self.connect('destroy', self._stop_preview)
         self.filechooser.connect('file_activated', self._response,
             Gtk.ResponseType.OK)
 
@@ -125,30 +133,25 @@ class _BaseFileChooserDialog(Gtk.Dialog):
     def add_archive_filters(self):
         """Add archive filters to the filechooser.
         """
-        ffilter = Gtk.FileFilter()
-        ffilter.set_name(_('All archives'))
-        self.filechooser.add_filter(ffilter)
-        supported_formats = archive_tools.get_supported_formats()
-        for name in sorted(supported_formats):
-            mime_types, extensions = supported_formats[name]
-            patterns = ['*.%s' % ext for ext in extensions]
-            self.add_filter(_('%s archives') % name, mime_types, patterns)
-            for mime in mime_types:
-                ffilter.add_mime_type(mime)
-            for pat in patterns:
-                ffilter.add_pattern(pat)
+        self._add_format_filters(_('All archives'), _('%s archives'),
+                                 archive_tools.get_supported_formats())
 
     def add_image_filters(self):
         """Add images filters to the filechooser.
         """
+        self._add_format_filters(_('All images'), _('%s images'),
+                                 image_tools.get_supported_formats())
+
+    def _add_format_filters(self, all_name, format_name, supported_formats):
+        """Add a filter matching every format in <supported_formats>, then
+        one filter per format named with the <format_name> template."""
         ffilter = Gtk.FileFilter()
-        ffilter.set_name(_('All images'))
+        ffilter.set_name(all_name)
         self.filechooser.add_filter(ffilter)
-        supported_formats = image_tools.get_supported_formats()
         for name in sorted(supported_formats):
             mime_types, extensions = supported_formats[name]
             patterns = ['*.%s' % ext for ext in extensions]
-            self.add_filter(_('%s images') % name, mime_types, patterns)
+            self.add_filter(format_name % name, mime_types, patterns)
             for mime in mime_types:
                 ffilter.add_mime_type(mime)
             for pat in patterns:
@@ -248,45 +251,79 @@ class _BaseFileChooserDialog(Gtk.Dialog):
         else:
             self.files_chosen([])
 
+        self._stop_preview()
+
+    def _clear_preview(self) -> None:
+        self._preview_image.clear()
+        self._namelabel.set_text('')
+        self._sizelabel.set_text('')
+
+    def _stop_preview(self, *args: object) -> None:
         self._destroyed = True
+        self._request_preview(None)
 
-    def _update_preview(self, *args):
-        if self.filechooser.get_preview_filename():
-            path = self.filechooser.get_preview_filename()
-        else:
-            path = None
-
-        if path and os.path.isfile(path):
-            thumbnailer = thumbnail_tools.Thumbnailer(size=(128, 128),
-                                                      archive_support=True)
-            thumbnailer.thumbnail_finished += self._preview_thumbnail_finished
-            thumbnailer.thumbnail(path, threaded=True)
-        else:
-            self._preview_image.clear()
-            self._namelabel.set_text('')
-            self._sizelabel.set_text('')
-
-    def _preview_thumbnail_finished(self, filepath, pixbuf):
-        """ Called when the thumbnailer has finished creating
-        the thumbnail for <filepath>. """
-
+    def _update_preview(self, *args: object) -> None:
         if self._destroyed:
             return
+        self._clear_preview()
+        self._request_preview(self.filechooser.get_preview_filename())
 
-        current_path = self.filechooser.get_preview_filename()
-        if current_path and current_path == filepath:
+    def _request_preview(self, path: Optional[str]) -> None:
+        """Replace any queued preview with <path>, cancel the running one and
+        make results of earlier requests stale."""
+        with self._preview_lock:
+            self._preview_generation += 1
+            self._preview_pending = (self._preview_generation, path) if path else None
+            if self._preview_thumbnailer is not None:
+                self._preview_thumbnailer.cancel()
+            if path and self._preview_worker is None:
+                self._preview_worker = threading.Thread(
+                    target=self._run_preview, name='filechooser-preview')
+                self._preview_worker.start()
 
-            if pixbuf is None:
-                self._preview_image.clear()
-                self._namelabel.set_text('')
-                self._sizelabel.set_text('')
+    def _run_preview(self) -> None:
+        """Thumbnail the latest request, one at a time, until none is left."""
+        while True:
+            with self._preview_lock:
+                request, self._preview_pending = self._preview_pending, None
+                if request is None:
+                    self._preview_worker = None
+                    return
+            generation, path = request
+            pixbuf = None
+            try:
+                thumbnailer = thumbnail_tools.Thumbnailer(
+                    size=(128, 128), archive_support=True)
+                with self._preview_lock:
+                    if generation != self._preview_generation:
+                        continue
+                    self._preview_thumbnailer = thumbnailer
+                if os.path.isfile(path):
+                    pixbuf = thumbnailer.thumbnail(path)
+            except Exception as error:
+                log.debug('Could not preview "%s": %s', path, error)
+            with self._preview_lock:
+                self._preview_thumbnailer = None
+            GLib.idle_add(self._preview_thumbnail_finished,
+                          generation, path, pixbuf)
 
-            else:
-                pixbuf = image_tools.add_border(pixbuf, 1)
-                self._preview_image.set_from_pixbuf(pixbuf)
-                self._namelabel.set_text(os.path.basename(filepath))
-                self._sizelabel.set_text(tools.format_byte_size(
-                    os.stat(filepath).st_size))
+    def _preview_thumbnail_finished(self, generation: int, filepath: str,
+                                    pixbuf: object) -> bool:
+        """ Show the thumbnail unless a newer selection was made. """
+        if self._destroyed or generation != self._preview_generation:
+            return False
+        try:
+            size = os.stat(filepath).st_size if pixbuf is not None else None
+        except OSError:
+            size = None
+        if size is None:
+            self._clear_preview()
+        else:
+            pixbuf = image_tools.add_border(pixbuf, 1)
+            self._preview_image.set_from_pixbuf(pixbuf)
+            self._namelabel.set_text(os.path.basename(filepath))
+            self._sizelabel.set_text(tools.format_byte_size(size))
+        return False
 
     def _current_file(self):
         # XXX: This method defers the import of main to avoid cyclic imports

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import pathlib
 import re
@@ -18,37 +19,11 @@ from mcomix import constants
 This file should be run from MComix' root directory, in order to avoid
 having to play around with relative path names.
 
-    Build instructions:
+    Run build_portable.bat from Windows Command Prompt or PowerShell.
+    It uses the conda-forge environment in .venv; see CLAUDE.md and
+    win32/README.md for setup. No MSYS2 or installer compiler is needed.
+    Builds one GUI application in dist/MComix; --zip also creates a ZIP.
 
-    0. To begin with, follow the installation instructions of PyGObject
-       on Windows. At the time of this writing, using MSYS2 is recommended.
-
-    1. Using the MSYS2 mingw64 shell, install:
-
-           pacman -Sy \
-               mingw-w64-x86_64-gtk3 \
-               mingw-w64-x86_64-python \
-               mingw-w64-x86_64-python-gobject \
-               mingw-w64-x86_64-python-pillow \
-               mingw-w64-x86_64-python-pymupdf \
-               mingw-w64-x86_64-libjxl
-
-    2. In the same shell, install pyinstaller with pip:
-
-           python3 -m pip install --user pyinstaller
-
-       Make sure that the installed pyinstaller executable is on PATH.
-       You may wish to use a virtual environment:
-
-           python3 -m venv venv --system-site-packages
-           . ./venv/bin/activate
-           python3 -m pip install pyinstaller
-
-    3. 'win32/build_pyinstaller.py' will create the folder 'dist/MComix'
-       and copy relevant libraries.
-
-    4. This script will copy images, translations and documentation
-       into the created distribution folder.
 """
 
 
@@ -87,15 +62,15 @@ def prepare_version_file() -> None:
 
 
 def run_pyinstaller(attach_console: bool) -> int:
-    """ Runs setup.py py2exe. """
+    """ Runs PyInstaller using the build environment's Python. """
     print('Executing pyinstaller...')
-    args = ['pyinstaller', 'win32/mcomix.spec', '--noconfirm']
+    args = [sys.executable, '-m', 'PyInstaller', 'win32/mcomix.spec', '--noconfirm', '--clean']
 
     # The spec file takes this environment setting to determine if a console should be attached
     environ = os.environ.copy()
     environ["PYINSTALLER_CONSOLE"] = "1" if attach_console else "0"
 
-    proc_result = subprocess.run(args, shell=True, env=environ)
+    proc_result = subprocess.run(args, env=environ)
 
     return proc_result.returncode
 
@@ -123,10 +98,8 @@ def copy_other_files() -> None:
     win32_newline('ChangeLog.md', 'dist/MComix/ChangeLog.md')
     win32_newline('README.md', 'dist/MComix/README.md')
     win32_newline('COPYING', 'dist/MComix/licenses/mcomix/COPYING.txt')
-
-    if os.path.isdir('../mcomix-other/unrar'):
-        shutil.copy('../mcomix-other/unrar/UnRAR64.dll', 'dist/MComix/UnRAR64.dll')
-        win32_newline('../mcomix-other/unrar/license.txt', 'dist/MComix/licenses/unrar/license.txt')
+    win32_newline('mcomix/upscale_models/README.md',
+                  'dist/MComix/licenses/upscale-models/README.md')
 
     if os.path.isdir('../mcomix-other/7z'):
         shutil.copy('../mcomix-other/7z/7z.exe', 'dist/MComix/7z.exe')
@@ -137,14 +110,13 @@ def copy_other_files() -> None:
         shutil.copy('../mcomix-other/mutool/mutool.exe', 'dist/MComix/mutool.exe')
         win32_newline('../mcomix-other/mutool/COPYING.txt', 'dist/MComix/licenses/mupdf/COPYING.txt')
 
-    licenses_basedir = '/mingw64/share/licenses'
-    components = ('atk', 'cairo', 'fontconfig', 'freetype', 'gdk-pixbuf2', 'glib2', 'gtk3', 'pango',
-                  'python-cairo', 'python-Pillow')
-    if os.path.isdir(licenses_basedir):
-        for entry in components:
-            path = os.path.join(licenses_basedir, entry)
-            if os.path.isdir(path):
-                shutil.copytree(path, os.path.join('dist/MComix/licenses', entry))
+    # Conda-forge stores shared licenses under the environment prefix.
+    for relative in ('Library/share/licenses', 'share/licenses'):
+        source = pathlib.Path(sys.prefix) / relative
+        if source.is_dir():
+            shutil.copytree(source, 'dist/MComix/licenses/conda-forge',
+                            dirs_exist_ok=True)
+
 
 
 def create_release_archive() -> None:
@@ -156,30 +128,27 @@ def create_release_archive() -> None:
             currentdir = pathlib.Path(dirpath)
             for filename in filenames:
                 full_file_path = currentdir / filename
-                zip.write(full_file_path, full_file_path.relative_to(basedir))
+                zip.write(full_file_path, pathlib.Path('MComix') / full_file_path.relative_to(basedir))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Build the portable Windows application.')
+    parser.add_argument('--zip', action='store_true',
+                        help='also create a ZIP of the portable application')
+    args = parser.parse_args()
+    prepare_version_file()
+    try:
+        clear_distdir('dist/MComix/')
+        if run_pyinstaller(attach_console=False) != 0:
+            sys.exit(1)
+        copy_other_files()
+        if args.zip:
+            create_release_archive()
+    finally:
+        os.unlink('win32/version_file.txt')
 
 
 if __name__ == '__main__':
-    prepare_version_file()
-
-    # First, a console application is created with default arguments from the spec
-    clear_distdir('dist/MComix/')
-    success = run_pyinstaller(attach_console=True) == 0
-    if not success:
-        sys.exit(1)
-
-    shutil.move('dist/MComix/MComix.exe', 'dist/MComix.Console.exe')
-
-    # Create version without console
-    clear_distdir('dist/MComix/')
-    success = run_pyinstaller(attach_console=False) == 0
-    if not success:
-        sys.exit(1)
-
-    os.unlink('win32/version_file.txt')
-
-    shutil.move('dist/MComix.Console.exe', 'dist/MComix/')
-    copy_other_files()
-    create_release_archive()
+    main()
 
 # vim: expandtab:sw=4:ts=4

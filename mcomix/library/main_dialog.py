@@ -2,11 +2,11 @@
 
 import os
 from gi.repository import Gdk, Gtk
+from typing import Any, List
 
 from mcomix.preferences import prefs
 from mcomix import i18n
 from mcomix import tools
-from mcomix import log
 from mcomix import file_chooser_library_dialog
 from mcomix import status
 from mcomix.library import backend as library_backend
@@ -20,6 +20,7 @@ _dialog = None
 # The "All books" collection is not a real collection stored in the library,
 # but is represented by this ID in the library's TreeModels.
 _COLLECTION_ALL = -1
+_USE_SELECTED_COLLECTION = object()
 
 class _LibraryDialog(Gtk.Window):
 
@@ -31,6 +32,7 @@ class _LibraryDialog(Gtk.Window):
         super(_LibraryDialog, self).__init__(Gtk.WindowType.TOPLEVEL)
 
         self._window = window
+        self._closed = False
 
         self.resize(prefs['lib window width'], prefs['lib window height'])
         self.set_title(_('Library'))
@@ -65,7 +67,11 @@ class _LibraryDialog(Gtk.Window):
     def open_book(self, books, keep_library_open=False):
         """Open the book with ID <book>."""
 
-        paths = [ self.backend.get_book_path(book) for book in books ]
+        # A book removed since it was listed has no path.
+        paths = [path for path in map(self.backend.get_book_path, books)
+                 if path is not None]
+        if not paths:
+            return
 
         if not keep_library_open:
             self.hide()
@@ -80,20 +86,19 @@ class _LibraryDialog(Gtk.Window):
     def scan_for_new_files(self):
         """ Start scanning for new files from the watch list. """
 
-        if len(self.backend.watchlist.get_watchlist()) > 0:
+        if not self._closed and len(self.backend.watchlist.get_watchlist()) > 0:
             self.set_status_message(_("Scanning for new books..."))
             self.backend.watchlist.scan_for_new_files()
 
     def _new_files_found(self, filelist, watchentry):
         """ Called after the scan for new files finished. """
 
+        if self._closed:
+            return
         if len(filelist) > 0:
-            if watchentry.collection.id is not None:
-                collection_name = watchentry.collection.name
-            else:
-                collection_name = None
-
-            self.add_books(filelist, collection_name)
+            self.add_books(filelist, collection_id=watchentry.collection.id)
+            if self._closed:
+                return
 
             if len(filelist) == 1:
                 message = _("Added new book '%(bookname)s' "
@@ -122,34 +127,39 @@ class _LibraryDialog(Gtk.Window):
 
     def close(self, *args):
         """Close the library and do required cleanup tasks."""
+        if self._closed:
+            return
+        self._closed = True
         prefs['lib window width'], prefs['lib window height'] = self.get_size()
         self.backend.watchlist.new_files_found -= self._new_files_found
+        self.backend.watchlist.stop_scan()
+        for dialog in Gtk.Window.list_toplevels():
+            if dialog.get_transient_for() is self:
+                dialog.destroy()
         self.book_area.stop_update()
         self.book_area.close()
         file_chooser_library_dialog.close_library_filechooser_dialog()
         _close_dialog()
 
-    def add_books(self, paths, collection_name=None):
-        """Add the books at <paths> to the library. If <collection_name>
-        is not None, it is the name of a (new or existing) collection the
-        books should be put in.
+    def add_books(self, paths: List[str], *,
+                  collection_id: Any = _USE_SELECTED_COLLECTION) -> None:
+        """Add books to an explicit destination or the current selection.
+
+        None or the All books model ID means no membership. Omitting the
+        destination uses the currently selected collection.
         """
-        if collection_name is None:
+        if self._closed or self.backend._con is None:
+            return
+        if collection_id is _USE_SELECTED_COLLECTION:
             collection_id = self.collection_area.get_current_collection()
-        else:
-            collection = self.backend.get_collection_by_name(collection_name)
-
-            if collection is None: # Collection by that name doesn't exist.
-                self.backend.add_collection(collection_name)
-                collection = self.backend.get_collection_by_name(
-                    collection_name)
-
-            collection_id = collection.id
+        if collection_id == _COLLECTION_ALL:
+            collection_id = None
 
         library_add_progress_dialog._AddLibraryProgressDialog(self, self._window, paths, collection_id)
 
-        if collection_id is not None:
-            prefs['last library collection'] = collection_id
+        if not self._closed and self.backend._con is not None and collection_id is not None:
+            if self.backend.get_collection_name(collection_id) is not None:
+                prefs['last library collection'] = collection_id
 
     def _key_press_event(self, widget, event, *args):
         """ Handle key press events for closing the library on Escape press. """
@@ -159,26 +169,16 @@ class _LibraryDialog(Gtk.Window):
 
 
 def open_dialog(action, window):
-    """ Shows the library window. If sqlite is not available, this method
-    does nothing and returns False. Otherwise, True is returned. """
+    """ Shows the library window and returns True. """
     global _dialog
 
     if _dialog is None:
-
-        if library_backend.dbapi2 is None:
-            text = _('! You need an sqlite wrapper to use the library.')
-            window.osd.show(text)
-            log.error(text)
-            return False
-
-        else:
-            _dialog = _LibraryDialog(window, window.filehandler)
+        _dialog = _LibraryDialog(window, window.filehandler)
+        if prefs['scan for new books on library startup']:
+            _dialog.scan_for_new_files()
 
     else:
         _dialog.present()
-
-    if prefs['scan for new books on library startup']:
-        _dialog.scan_for_new_files()
 
     return True
 

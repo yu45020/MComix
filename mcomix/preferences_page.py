@@ -12,20 +12,16 @@ class _PreferencePage(Gtk.Box):
     _PreferenceSections.
     """
 
-    def __init__(self, right_column_width):
-        """Create a new page where any possible right columns have the
-        width request <right_column_width>.
-        """
+    def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.set_border_width(12)
-        self._right_column_width = right_column_width
         self._section = None
 
     def new_section(self, header):
         """Start a new section in the page, with the header text from
         <header>.
         """
-        self._section = preferences_section._PreferenceSection(header, self._right_column_width)
+        self._section = preferences_section._PreferenceSection(header)
         self.pack_start(self._section, False, False, 0)
 
     def add_row(self, left_item, right_item=None):

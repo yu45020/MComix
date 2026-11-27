@@ -15,12 +15,14 @@ class Pageselector(Gtk.Dialog):
 
     def __init__(self, window):
         self._window = window
-        super(Pageselector, self).__init__("Go to page...", window,
+        self._closed = False
+        super(Pageselector, self).__init__(_('Go to page...'), window,
                                      Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT)
         self.add_buttons(_('_Go'), Gtk.ResponseType.OK,
                          _('_Cancel'), Gtk.ResponseType.CANCEL,)
         self.set_default_response(Gtk.ResponseType.OK)
         self.connect('response', self._response)
+        self.connect('destroy', self._cleanup)
         self.set_resizable(True)
 
         self._number_of_pages = self._window.imagehandler.get_number_of_pages()
@@ -103,12 +105,20 @@ class Pageselector(Gtk.Dialog):
         if event == Gtk.ResponseType.OK:
             self._window.set_page(int(self._selector_adjustment.props.value))
 
+        self.destroy()
+
+    def _cleanup(self, *args: object) -> None:
+        """Stop the owned preview on every destroy path, including shutdown."""
+        if self._closed:
+            return
+        self._closed = True
         self._window.imagehandler.page_available -= self._page_available
         self._thread.stop()
-        self.destroy()
 
     def _update_thumbnail(self, page):
         """ Trigger a thumbnail update. """
+        if self._closed:
+            return
         width = self._image_preview.get_allocation().width
         height = self._image_preview.get_allocation().height
         self._thumbnail_page = page
@@ -127,7 +137,7 @@ class Pageselector(Gtk.Dialog):
     @callback.Callback
     def _thumbnail_finished(self, page, pixbuf):
         # Don't bother if we changed page in the meantime.
-        if page == self._thumbnail_page:
+        if not self._closed and page == self._thumbnail_page:
             self._image_preview.set_from_pixbuf(pixbuf)
 
     def _page_available(self, page):

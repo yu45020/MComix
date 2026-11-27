@@ -42,8 +42,15 @@ class _PropertiesDialog(Gtk.Dialog):
         self._window.filehandler.file_opened += self._on_book_change
         self._window.filehandler.file_closed += self._on_book_change
         self._window.imagehandler.page_available += self._on_page_available
+        self.connect('destroy', self._detach_callbacks)
 
         self.show_all()
+
+    def _detach_callbacks(self, widget: Gtk.Widget) -> None:
+        self._window.page_changed -= self._on_page_change
+        self._window.filehandler.file_opened -= self._on_book_change
+        self._window.filehandler.file_closed -= self._on_book_change
+        self._window.imagehandler.page_available -= self._on_page_available
 
     def _on_page_change(self):
         self._update_image_page()
@@ -71,7 +78,7 @@ class _PropertiesDialog(Gtk.Dialog):
         if path is not None:
             window.filehandler._ask_for_files([path])
         self._update_page_image(page, 1)
-        filename = window.filehandler.get_pretty_current_filename()
+        filename = window.imagehandler.get_pretty_current_filename()
         page.set_filename(filename)
         path = window.filehandler.get_path_to_base()
         main_info = (
@@ -115,7 +122,11 @@ class _PropertiesDialog(Gtk.Dialog):
         ]
         try:
             stats = os.stat(location)
-        except OSError as e:
+        except OSError:
+            # Archive pages read on demand have no file, but a known size.
+            size = self._window.filehandler.get_file_size(location)
+            if size is not None:
+                secondary_info.append((_('Size'), tools.format_byte_size(size)))
             page.set_secondary_info(secondary_info)
             return
         if _has_pwd:
